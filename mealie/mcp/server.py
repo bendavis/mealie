@@ -14,7 +14,7 @@ from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 from mealie.db.db_setup import session_context
 from mealie.mcp.oauth import (
@@ -106,16 +106,32 @@ async def _buffer_request(receive: Receive, max_bytes: int = 4 * 1024 * 1024) ->
     return bytes(body), replay
 
 
-def _challenge(status: int, scope: str | None = None) -> Response:
+def _challenge(status: int, scope: str | None = None, request_id: str | int | None = None) -> Response:
     fields = [f'resource_metadata="{_metadata_url("oauth-protected-resource", "/mcp")}"']
     if scope:
         fields.append(f'scope="{scope}"')
     if status == 403:
         fields.append('error="insufficient_scope"')
+        fields.append(f'error_description="The requested tool requires the {scope} scope"')
+    else:
+        fields.append('error="invalid_token"')
+        fields.append('error_description="A valid MCP OAuth access token is required"')
+    challenge = "Bearer " + ", ".join(fields)
+    body: dict = {"error": "insufficient_scope" if status == 403 else "invalid_token"}
+    if status == 403 and request_id is not None:
+        body = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": f"MCP permission required: {scope}"}],
+                "_meta": {"mcp/www_authenticate": [challenge]},
+                "isError": True,
+            },
+        }
     return JSONResponse(
-        {"error": "insufficient_scope" if status == 403 else "invalid_token"},
+        body,
         status_code=status,
-        headers={"WWW-Authenticate": "Bearer " + ", ".join(fields), "Cache-Control": "no-store"},
+        headers={"WWW-Authenticate": challenge, "Cache-Control": "no-store"},
     )
 
 
@@ -135,6 +151,41 @@ class McpRouteAdapter:
         self.sdk_app = sdk_app
         self.sdk_path = sdk_path
         self.public_path = public_path
+
+    async def _send_tool_list(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Add tool OAuth metadata that the pinned MCP SDK cannot serialize."""
+        messages: list[Message] = []
+
+        async def capture(message: Message) -> None:
+            messages.append(message)
+
+        await self.sdk_app(scope, receive, capture)
+        starts = [message for message in messages if message["type"] == "http.response.start"]
+        bodies = [message for message in messages if message["type"] == "http.response.body"]
+        if len(starts) != 1 or not bodies or starts[0]["status"] != 200:
+            for message in messages:
+                await send(message)
+            return
+        try:
+            payload = json.loads(b"".join(message.get("body", b"") for message in bodies))
+            listed = payload["result"]["tools"]
+            from mealie.mcp.tools import TOOL_SCOPES
+
+            for tool in listed:
+                required_scope = TOOL_SCOPES.get(tool["name"])
+                if required_scope:
+                    tool["securitySchemes"] = [{"type": "oauth2", "scopes": [required_scope]}]
+            content = json.dumps(payload, separators=(",", ":")).encode()
+        except KeyError, TypeError, ValueError:
+            for message in messages:
+                await send(message)
+            return
+        start = dict(starts[0])
+        start["headers"] = [
+            (key, value) for key, value in start.get("headers", []) if key.lower() != b"content-length"
+        ] + [(b"content-length", str(len(content)).encode())]
+        await send(start)
+        await send({"type": "http.response.body", "body": content, "more_body": False})
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         with session_context() as session:
@@ -186,16 +237,27 @@ class McpRouteAdapter:
                 if buffered is None:
                     return await Response(status_code=413)(scope, receive, send)
                 body, receive = buffered
+                tool_listing = False
                 try:
                     request_json = json.loads(body)
+                    tool_listing = request_json.get("method") == "tools/list"
                     if request_json.get("method") == "tools/call":
                         from mealie.mcp.tools import TOOL_SCOPES
 
                         required = TOOL_SCOPES.get(request_json.get("params", {}).get("name"))
                         if required and required not in token.scopes:
-                            return await _challenge(403, required)(scope, receive, send)
+                            request_id = request_json.get("id")
+                            if isinstance(request_id, bool) or not isinstance(request_id, str | int):
+                                request_id = None
+                            return await _challenge(403, required, request_id)(scope, receive, send)
                 except ValueError, AttributeError, TypeError:
                     pass
+
+                if tool_listing:
+                    mapped_scope = dict(scope)
+                    mapped_scope["path"] = self.sdk_path
+                    mapped_scope["raw_path"] = self.sdk_path.encode()
+                    return await self._send_tool_list(mapped_scope, receive, send)
 
         mapped_scope = dict(scope)
         mapped_scope["path"] = self.sdk_path
@@ -215,6 +277,8 @@ async def authorization_metadata(request: Request) -> JSONResponse:
     ).model_dump(mode="json", exclude_none=True)
     metadata["client_id_metadata_document_supported"] = True
     metadata["authorization_response_iss_parameter_supported"] = True
+    metadata["token_endpoint_auth_methods_supported"] = ["none", "client_secret_post", "client_secret_basic"]
+    metadata["revocation_endpoint_auth_methods_supported"] = ["none", "client_secret_post", "client_secret_basic"]
     return JSONResponse(metadata, headers={"Cache-Control": "no-store"})
 
 

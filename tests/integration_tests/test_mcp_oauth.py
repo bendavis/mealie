@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
@@ -15,8 +15,10 @@ from fastapi.testclient import TestClient
 
 from mealie.app import app
 from mealie.db.db_setup import session_context
+from mealie.db.models.server.mcp import McpToken
 from mealie.db.models.users.users import User
-from mealie.mcp.oauth import utcnow
+from mealie.mcp.oauth import digest, utcnow
+from mealie.mcp.tools import TOOL_SCOPES
 
 RESOURCE = "http://localhost:8080/mcp"
 
@@ -47,6 +49,25 @@ def _tool(client: TestClient, token: str, name: str, arguments: dict | None = No
     )
 
 
+def _list_tools(client: TestClient, token: str):
+    return client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {token}", "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {"name": "Mealie test", "version": "1"},
+                }
+            },
+        },
+    )
+
+
 def _tool_result(response) -> dict:
     assert response.status_code == 200, response.text
     result = response.json()["result"]
@@ -67,6 +88,10 @@ def test_native_mcp_oauth_flow_and_switch():
         metadata = client.get("/.well-known/oauth-protected-resource/mcp").json()
         assert metadata["resource"] == RESOURCE
         assert "recipes:read" in metadata["scopes_supported"]
+        auth_metadata = client.get("/.well-known/oauth-authorization-server/oauth").json()
+        assert auth_metadata["issuer"] == "http://localhost:8080/oauth"
+        assert "none" in auth_metadata["token_endpoint_auth_methods_supported"]
+        assert auth_metadata["code_challenge_methods_supported"] == ["S256"]
         assert client.get("/mcp").status_code == 401
         assert _tool(client, login.json()["access_token"], "get_profile").status_code == 401
         registration = client.post(
@@ -93,6 +118,17 @@ def test_native_mcp_oauth_flow_and_switch():
             "scope": "profile:read recipes:read",
             "state": "test-state",
         }
+        wrong_redirect = client.get(
+            "/oauth/authorize",
+            params={**auth_params, "redirect_uri": "http://127.0.0.1:5600/callback"},
+            follow_redirects=False,
+        )
+        assert wrong_redirect.status_code == 400
+        plain_pkce = client.get(
+            "/oauth/authorize", params={**auth_params, "code_challenge_method": "plain"}, follow_redirects=False
+        )
+        assert plain_pkce.status_code == 302
+        assert "error" in parse_qs(urlsplit(plain_pkce.headers["location"]).query)
         authorization = client.get("/oauth/authorize", params=auth_params, follow_redirects=False)
         assert authorization.status_code == 302, authorization.text
         consent = client.get(authorization.headers["location"])
@@ -121,13 +157,25 @@ def test_native_mcp_oauth_flow_and_switch():
         assert tokens.status_code == 200, tokens.text
         access = tokens.json()["access_token"]
         assert client.post("/oauth/token", data=token_fields).status_code == 400  # one-time code
-        profile = _tool_result(_tool(client, access, "get_profile"))
+        listed = _list_tools(client, access)
+        assert listed.status_code == 200, listed.text
+        advertised = {tool["name"]: tool for tool in listed.json()["result"]["tools"]}
+        assert advertised.keys() == TOOL_SCOPES.keys()
+        for name, required_scope in TOOL_SCOPES.items():
+            assert advertised[name]["securitySchemes"] == [{"type": "oauth2", "scopes": [required_scope]}]
+            assert advertised[name]["_meta"]["securitySchemes"] == advertised[name]["securitySchemes"]
+        assert advertised["get_profile"]["_meta"]["openai/profile"] is True
+        assert advertised["get_profile"]["outputSchema"]["additionalProperties"] is False
+        profile_response = _tool(client, access, "get_profile")
+        profile = _tool_result(profile_response)
+        assert profile_response.json()["result"]["structuredContent"]["id"] == profile["id"]
         _tool_result(_tool(client, access, "search_recipes"))
         denied = _tool(
             client, access, "add_shopping_item", {"list_id": "00000000-0000-0000-0000-000000000000", "note": "Milk"}
         )
         assert denied.status_code == 403
         assert 'scope="shopping:write"' in denied.headers["www-authenticate"]
+        assert denied.json()["result"]["_meta"]["mcp/www_authenticate"] == [denied.headers["www-authenticate"]]
         assert client.get("/api/users/self", headers={"Authorization": f"Bearer {access}"}).status_code == 401
         read_grant_id = client.get("/api/users/mcp/connections").json()[0]["id"]
 
@@ -191,6 +239,18 @@ def test_native_mcp_oauth_flow_and_switch():
             _tool(client, write_access, "update_meal_plan_entry", {"entry_id": meal["id"], "title": "MCP supper"})
         )
         _tool_result(_tool(client, write_access, "list_meal_plan"))
+
+        with session_context() as session:
+            access_row = session.query(McpToken).filter_by(token_hash=digest(write_access)).one()
+            original_expiry = access_row.expires_at
+            access_row.expires_at = utcnow() - timedelta(seconds=1)
+            session.commit()
+        assert _tool(client, write_access, "get_profile").status_code == 401
+        with session_context() as session:
+            access_row = session.query(McpToken).filter_by(token_hash=digest(write_access)).one()
+            access_row.expires_at = original_expiry
+            session.commit()
+        assert _tool(client, write_access, "get_profile").status_code == 200
 
         # Even an administrator's MCP grant stays bound to the approved household.
         group = client.get("/api/groups/self", headers=mealie_auth).json()

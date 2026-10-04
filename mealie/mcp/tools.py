@@ -4,10 +4,12 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date
+from typing import Any
 from uuid import UUID
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict
 
 from mealie.db.db_setup import session_context
 from mealie.db.models.users.users import User
@@ -44,6 +46,22 @@ READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_h
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 UPDATE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
 logger = logging.getLogger("mealie.mcp")
+
+
+class McpProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str | None = None
+    email: str | None = None
+    nickname: str | None = None
+
+
+def _tool_meta(name: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {"securitySchemes": [{"type": "oauth2", "scopes": [TOOL_SCOPES[name]]}]}
+    if name == "get_profile":
+        meta["openai/profile"] = True
+    return meta
 
 
 @contextmanager
@@ -84,19 +102,15 @@ def _summary(item, url: str | None = None) -> dict:
     return result
 
 
-@mcp.tool(description="Identify the connected Mealie account and household.", annotations=READ)
-def get_profile() -> dict:
+@mcp.tool(
+    description="Identify the connected Mealie account and household.", annotations=READ, meta=_tool_meta("get_profile")
+)
+def get_profile() -> McpProfile:
     with _context("profile:read") as (user, _, __):
-        return {
-            "id": str(user.id),
-            "name": user.full_name,
-            "email": user.email,
-            "group": user.group,
-            "household": user.household,
-        }
+        return McpProfile(id=str(user.id), name=user.full_name, email=user.email, nickname=user.household)
 
 
-@mcp.tool(description="Search recipes in the connected household.", annotations=READ)
+@mcp.tool(description="Search recipes in the connected household.", annotations=READ, meta=_tool_meta("search_recipes"))
 def search_recipes(search: str = "", page: int = 1, per_page: int = 25) -> dict:
     from mealie.mcp.oauth import public_base_url
 
@@ -113,7 +127,11 @@ def search_recipes(search: str = "", page: int = 1, per_page: int = 25) -> dict:
         }
 
 
-@mcp.tool(description="Read a recipe by its slug or ID in the connected household.", annotations=READ)
+@mcp.tool(
+    description="Read a recipe by its slug or ID in the connected household.",
+    annotations=READ,
+    meta=_tool_meta("get_recipe"),
+)
 def get_recipe(slug_or_id: str) -> dict:
     from mealie.mcp.oauth import public_base_url
 
@@ -128,7 +146,9 @@ def get_recipe(slug_or_id: str) -> dict:
         return _summary(recipe, f"{public_base_url()}/g/{user.group_slug}/r/{recipe.slug}")
 
 
-@mcp.tool(description="Create a new recipe in the connected household.", annotations=WRITE)
+@mcp.tool(
+    description="Create a new recipe in the connected household.", annotations=WRITE, meta=_tool_meta("create_recipe")
+)
 def create_recipe(name: str) -> dict:
     from mealie.mcp.oauth import public_base_url
 
@@ -147,7 +167,11 @@ def create_recipe(name: str) -> dict:
         }
 
 
-@mcp.tool(description="Change a recipe's name or description where the connected user may edit it.", annotations=UPDATE)
+@mcp.tool(
+    description="Change a recipe's name or description where the connected user may edit it.",
+    annotations=UPDATE,
+    meta=_tool_meta("update_recipe"),
+)
 def update_recipe(slug_or_id: str, name: str | None = None, description: str | None = None) -> dict:
     if name is None and description is None:
         raise ValueError("Provide a name or description")
@@ -168,7 +192,11 @@ def update_recipe(slug_or_id: str, name: str | None = None, description: str | N
         return {"id": str(updated.id), "slug": updated.slug, "name": updated.name}
 
 
-@mcp.tool(description="List meal plan entries for the connected household.", annotations=READ)
+@mcp.tool(
+    description="List meal plan entries for the connected household.",
+    annotations=READ,
+    meta=_tool_meta("list_meal_plan"),
+)
 def list_meal_plan(
     page: int = 1, per_page: int = 25, start_date: date | None = None, end_date: date | None = None
 ) -> dict:
@@ -185,7 +213,11 @@ def list_meal_plan(
         return {"page": found.page, "total": found.total, "items": [_summary(item) for item in found.items]}
 
 
-@mcp.tool(description="Add a meal plan entry for the connected household.", annotations=WRITE)
+@mcp.tool(
+    description="Add a meal plan entry for the connected household.",
+    annotations=WRITE,
+    meta=_tool_meta("add_meal_plan_entry"),
+)
 def add_meal_plan_entry(
     date: date, title: str = "", recipe_id: str | None = None, entry_type: PlanEntryType = PlanEntryType.dinner
 ) -> dict:
@@ -209,7 +241,11 @@ def add_meal_plan_entry(
         return _summary(item)
 
 
-@mcp.tool(description="Change the title, date, or meal type of a household meal plan entry.", annotations=UPDATE)
+@mcp.tool(
+    description="Change the title, date, or meal type of a household meal plan entry.",
+    annotations=UPDATE,
+    meta=_tool_meta("update_meal_plan_entry"),
+)
 def update_meal_plan_entry(
     entry_id: int, date: date | None = None, title: str | None = None, entry_type: PlanEntryType | None = None
 ) -> dict:
@@ -230,14 +266,20 @@ def update_meal_plan_entry(
         return _summary(result)
 
 
-@mcp.tool(description="List shopping lists in the connected household.", annotations=READ)
+@mcp.tool(
+    description="List shopping lists in the connected household.",
+    annotations=READ,
+    meta=_tool_meta("list_shopping_lists"),
+)
 def list_shopping_lists(page: int = 1, per_page: int = 25) -> dict:
     with _context("shopping:read") as (_, repos, __):
         found = repos.group_shopping_lists.page_all(_page(page, per_page))
         return {"page": found.page, "total": found.total, "items": [_summary(item) for item in found.items]}
 
 
-@mcp.tool(description="Read a household shopping list and its items.", annotations=READ)
+@mcp.tool(
+    description="Read a household shopping list and its items.", annotations=READ, meta=_tool_meta("get_shopping_list")
+)
 def get_shopping_list(list_id: str) -> dict:
     with _context("shopping:read") as (_, repos, __):
         item = repos.group_shopping_lists.get_one(UUID(list_id))
@@ -246,7 +288,9 @@ def get_shopping_list(list_id: str) -> dict:
         return _summary(item)
 
 
-@mcp.tool(description="Add an item to a household shopping list.", annotations=WRITE)
+@mcp.tool(
+    description="Add an item to a household shopping list.", annotations=WRITE, meta=_tool_meta("add_shopping_item")
+)
 def add_shopping_item(list_id: str, note: str, quantity: float = 1) -> dict:
     with _context("shopping:write") as (user, repos, __):
         list_uuid = UUID(list_id)
@@ -282,13 +326,21 @@ def _update_item(
         return result.model_dump(mode="json", by_alias=True)
 
 
-@mcp.tool(description="Edit an item on a household shopping list.", annotations=UPDATE)
+@mcp.tool(
+    description="Edit an item on a household shopping list.",
+    annotations=UPDATE,
+    meta=_tool_meta("update_shopping_item"),
+)
 def update_shopping_item(item_id: str, note: str | None = None, quantity: float | None = None) -> dict:
     if note is None and quantity is None:
         raise ValueError("Provide a note or quantity")
     return _update_item(item_id, note=note, quantity=quantity)
 
 
-@mcp.tool(description="Check or uncheck an item on a household shopping list.", annotations=UPDATE)
+@mcp.tool(
+    description="Check or uncheck an item on a household shopping list.",
+    annotations=UPDATE,
+    meta=_tool_meta("set_shopping_item_checked"),
+)
 def set_shopping_item_checked(item_id: str, checked: bool) -> dict:
     return _update_item(item_id, checked=checked)
