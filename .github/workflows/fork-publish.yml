@@ -7,7 +7,7 @@ name: Publish Fork Image to Docker Hub
 on:
   push:
     branches:
-      - feature/native-mcp
+      - mealie-next
     tags:
       - "v*"
     paths-ignore:
@@ -63,7 +63,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/feature/native-mcp' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/mealie-next' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
