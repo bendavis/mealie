@@ -243,6 +243,34 @@ def test_native_mcp_oauth_flow_and_switch():
         assert reused.status_code == 400
         assert _tool(client, write_access, "get_profile").status_code == 401
         assert _tool(client, rotated.json()["access_token"], "get_profile").status_code == 401
+
+        revoke_authorization = client.get("/oauth/authorize", params=auth_params, follow_redirects=False)
+        revoke_consent = client.get(revoke_authorization.headers["location"])
+        revoke_form = {
+            item["name"]: item["value"]
+            for item in BeautifulSoup(revoke_consent.text, "html.parser").select("input[type=hidden]")
+        }
+        revoke_approval = client.post(
+            "/oauth/consent", data={**revoke_form, "decision": "approve"}, follow_redirects=False
+        )
+        revoke_code = parse_qs(urlsplit(revoke_approval.headers["location"]).query)["code"][0]
+        revoke_tokens = client.post("/oauth/token", data={**token_fields, "code": revoke_code})
+        assert revoke_tokens.status_code == 200, revoke_tokens.text
+        revoke_access = revoke_tokens.json()["access_token"]
+        assert _tool(client, revoke_access, "get_profile").status_code == 200
+        revocation = client.post(
+            "/oauth/revoke",
+            data={"token": revoke_access, "token_type_hint": "access_token", "client_id": client_id},
+        )
+        assert revocation.status_code == 200, revocation.text
+        assert _tool(client, revoke_access, "get_profile").status_code == 401
+        assert (
+            client.post(
+                "/oauth/token",
+                data={**refresh_fields, "refresh_token": revoke_tokens.json()["refresh_token"]},
+            ).status_code
+            == 400
+        )
         assert client.put("/api/admin/mcp", json={"enabled": False}, headers=mealie_auth).status_code == 200
         assert _tool(client, write_access, "get_profile").status_code == 404
         assert client.get("/.well-known/oauth-authorization-server").status_code == 404

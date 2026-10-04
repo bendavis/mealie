@@ -130,7 +130,7 @@ class McpRouteAdapter:
                 scope, receive, send
             )
 
-        if self.public_path == "/oauth/token" and scope.get("method") == "POST":
+        if self.public_path in {"/oauth/token", "/oauth/revoke"} and scope.get("method") == "POST":
             buffered = await _buffer_request(receive, 64 * 1024)
             if buffered is None:
                 return await Response(status_code=413)(scope, receive, send)
@@ -139,12 +139,24 @@ class McpRouteAdapter:
                 fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
             except UnicodeDecodeError:
                 fields = {}
-            if fields.get("resource") != [mcp_url()]:
+            if self.public_path == "/oauth/token" and fields.get("resource") != [mcp_url()]:
                 return await JSONResponse(
                     {"error": "invalid_target", "error_description": "The resource must be this Mealie MCP URL"},
                     status_code=400,
                     headers={"Cache-Control": "no-store"},
                 )(scope, receive, send)
+            if self.public_path == "/oauth/revoke" and "client_secret" not in fields:
+                # The SDK's revocation form model currently requires this nullable field.
+                # Public OAuth clients are allowed to omit it entirely.
+                original_receive = receive
+
+                async def receive_with_empty_secret():
+                    message = await original_receive()
+                    if message.get("type") == "http.request":
+                        return {**message, "body": body + b"&client_secret="}
+                    return message
+
+                receive = receive_with_empty_secret
 
         if self.public_path == "/mcp":
             header_map = {key.lower(): value for key, value in scope.get("headers", [])}
