@@ -3,6 +3,9 @@
 import base64
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -274,3 +277,34 @@ def test_native_mcp_oauth_flow_and_switch():
         assert client.put("/api/admin/mcp", json={"enabled": False}, headers=mealie_auth).status_code == 200
         assert _tool(client, write_access, "get_profile").status_code == 404
         assert client.get("/.well-known/oauth-authorization-server").status_code == 404
+
+
+def test_http_base_url_does_not_prevent_mealie_startup(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """from mealie.app import app
+from mealie.mcp.oauth import validate_enablement_url
+assert app is not None
+try:
+    validate_enablement_url()
+except ValueError:
+    pass
+else:
+    raise AssertionError('Remote HTTP must not enable MCP')
+""",
+        ],
+        env={
+            **os.environ,
+            "BASE_URL": "http://mealie.example.com",
+            "DATA_DIR": str(tmp_path),
+            "PRODUCTION": "True",
+            "TESTING": "True",
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
