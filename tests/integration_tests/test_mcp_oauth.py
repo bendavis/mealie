@@ -118,6 +118,29 @@ def test_native_mcp_oauth_flow_and_switch():
             "scope": "profile:read recipes:read",
             "state": "test-state",
         }
+        default_authorization = client.get(
+            "/oauth/authorize",
+            params={key: value for key, value in auth_params.items() if key != "scope"},
+            follow_redirects=False,
+        )
+        assert default_authorization.status_code == 302, default_authorization.text
+        default_consent = client.get(default_authorization.headers["location"])
+        assert default_consent.status_code == 200
+        assert "Read recipes" in default_consent.text
+        assert "Read your household meal plan" in default_consent.text
+        assert "Read your household shopping lists" in default_consent.text
+        assert "Create and edit recipes" not in default_consent.text
+        assert "Change your household meal plan" not in default_consent.text
+        assert "Change items on your household shopping lists" not in default_consent.text
+        default_form = {
+            item["name"]: item["value"]
+            for item in BeautifulSoup(default_consent.text, "html.parser").select("input[type=hidden]")
+        }
+        default_denial = client.post(
+            "/oauth/consent", data={**default_form, "decision": "deny"}, follow_redirects=False
+        )
+        assert default_denial.status_code == 302
+        assert parse_qs(urlsplit(default_denial.headers["location"]).query)["error"] == ["access_denied"]
         wrong_redirect = client.get(
             "/oauth/authorize",
             params={**auth_params, "redirect_uri": "http://127.0.0.1:5600/callback"},
