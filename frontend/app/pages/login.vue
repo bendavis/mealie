@@ -283,6 +283,10 @@ whenever(
     const redirectTarget = redirectFromQuery ?? pendingShareRedirect.value;
     if (isSafeRedirectTarget(redirectTarget)) {
       pendingShareRedirect.value = null;
+      if (redirectTarget.startsWith("/oauth/consent?request=")) {
+        navigateTo(redirectTarget, { external: true });
+        return;
+      }
       router.push(redirectTarget);
       return;
     }
