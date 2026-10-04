@@ -179,6 +179,8 @@ def _validate_client(client: OAuthClientInformationFull) -> None:
 async def _fetch_client_metadata(client_id: str) -> OAuthClientInformationFull | None:
     """Resolve a CIMD URL with bounded, public-only network access."""
     try:
+        if len(client_id) > 2048:
+            return None
         parts = urlsplit(client_id)
         if (
             parts.scheme != "https"
@@ -218,13 +220,19 @@ async def _fetch_client_metadata(client_id: str) -> OAuthClientInformationFull |
         payload = json.loads(content)
         if not isinstance(payload, dict) or payload.get("client_id") != client_id:
             return None
+        methods = payload.get("token_endpoint_auth_methods_supported")
+        if methods is not None:
+            if not isinstance(methods, list) or "none" not in methods:
+                return None
+        elif payload.get("token_endpoint_auth_method", "none") != "none":
+            return None
         result = OAuthClientInformationFull.model_validate(
             {
                 **payload,
                 "client_id": client_id,
                 "client_secret": None,
                 "token_endpoint_auth_method": "none",
-                "scope": " ".join(SCOPES),
+                "scope": payload.get("scope") or " ".join(SCOPES),
             }
         )
         _validate_client(result)
