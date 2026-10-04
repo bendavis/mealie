@@ -340,6 +340,14 @@ def test_native_mcp_oauth_flow_and_switch():
             user_model = session.get(User, UUID(profile["id"]))
             assert user_model is not None
             user_model.locked_at = None
+            original_valid_after = user_model.tokens_valid_after
+            user_model.tokens_valid_after = utcnow() + timedelta(seconds=1)
+            session.commit()
+        assert _tool(client, write_access, "get_profile").status_code == 401
+        with session_context() as session:
+            user_model = session.get(User, UUID(profile["id"]))
+            assert user_model is not None
+            user_model.tokens_valid_after = original_valid_after
             session.commit()
         assert _tool(client, write_access, "get_profile").status_code == 200
 
