@@ -281,17 +281,46 @@ def test_native_mcp_oauth_flow_and_switch():
         other_recipe = client.post("/api/recipes", json={"name": "Other household secret"}, headers=other_auth)
         assert other_recipe.status_code == 201, other_recipe.text
         other_slug = other_recipe.json()
+        search = _tool_result(_tool(client, write_access, "search_recipes", {"search": "Other household secret"}))
+        assert all(item["slug"] != other_slug for item in search["items"])
         assert _tool(client, write_access, "get_recipe", {"slug_or_id": other_slug}).json()["result"]["isError"]
         assert _tool(client, write_access, "update_recipe", {"slug_or_id": other_slug, "name": "Wrong"}).json()[
             "result"
         ]["isError"]
+        other_meal = client.post(
+            "/api/households/mealplans",
+            json={"date": datetime.now(UTC).date().isoformat(), "entry_type": "dinner", "title": "Other dinner"},
+            headers=other_auth,
+        )
+        assert other_meal.status_code == 201, other_meal.text
+        other_meal_id = other_meal.json()["id"]
+        plans = _tool_result(_tool(client, write_access, "list_meal_plan"))
+        assert all(item["id"] != other_meal_id for item in plans["items"])
+        assert _tool(
+            client, write_access, "update_meal_plan_entry", {"entry_id": other_meal_id, "title": "Wrong"}
+        ).json()["result"]["isError"]
         other_list = client.post("/api/households/shopping/lists", json={"name": "Other list"}, headers=other_auth)
         assert other_list.status_code == 201
         other_list_id = other_list.json()["id"]
+        lists = _tool_result(_tool(client, write_access, "list_shopping_lists"))
+        assert all(item["id"] != other_list_id for item in lists["items"])
         assert _tool(client, write_access, "get_shopping_list", {"list_id": other_list_id}).json()["result"]["isError"]
         assert _tool(client, write_access, "add_shopping_item", {"list_id": other_list_id, "note": "Wrong"}).json()[
             "result"
         ]["isError"]
+        other_item = client.post(
+            "/api/households/shopping/items",
+            json={"shopping_list_id": other_list_id, "note": "Other milk", "quantity": 1},
+            headers=other_auth,
+        )
+        assert other_item.status_code == 201, other_item.text
+        other_item_id = other_item.json()["createdItems"][0]["id"]
+        assert _tool(client, write_access, "update_shopping_item", {"item_id": other_item_id, "note": "Wrong"}).json()[
+            "result"
+        ]["isError"]
+        assert _tool(
+            client, write_access, "set_shopping_item_checked", {"item_id": other_item_id, "checked": True}
+        ).json()["result"]["isError"]
 
         with session_context() as session:
             user_model = session.get(User, UUID(profile["id"]))
