@@ -8,12 +8,15 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
 
 from mealie.app import app
+from mealie.db.db_setup import session_context
+from mealie.db.models.users.users import User
+from mealie.mcp.oauth import utcnow
 
 RESOURCE = "http://localhost:8080/mcp"
 
@@ -118,7 +121,7 @@ def test_native_mcp_oauth_flow_and_switch():
         assert tokens.status_code == 200, tokens.text
         access = tokens.json()["access_token"]
         assert client.post("/oauth/token", data=token_fields).status_code == 400  # one-time code
-        _tool_result(_tool(client, access, "get_profile"))
+        profile = _tool_result(_tool(client, access, "get_profile"))
         _tool_result(_tool(client, access, "search_recipes"))
         denied = _tool(
             client, access, "add_shopping_item", {"list_id": "00000000-0000-0000-0000-000000000000", "note": "Milk"}
@@ -229,6 +232,27 @@ def test_native_mcp_oauth_flow_and_switch():
         assert _tool(client, write_access, "add_shopping_item", {"list_id": other_list_id, "note": "Wrong"}).json()[
             "result"
         ]["isError"]
+
+        with session_context() as session:
+            user_model = session.get(User, UUID(profile["id"]))
+            assert user_model is not None
+            original_household = user_model.household_id
+            user_model.household_id = UUID(other_household.json()["id"])
+            session.commit()
+        assert _tool(client, write_access, "get_profile").status_code == 401
+        with session_context() as session:
+            user_model = session.get(User, UUID(profile["id"]))
+            assert user_model is not None
+            user_model.household_id = original_household
+            user_model.locked_at = utcnow()
+            session.commit()
+        assert _tool(client, write_access, "get_profile").status_code == 401
+        with session_context() as session:
+            user_model = session.get(User, UUID(profile["id"]))
+            assert user_model is not None
+            user_model.locked_at = None
+            session.commit()
+        assert _tool(client, write_access, "get_profile").status_code == 200
 
         connections = client.get("/api/users/mcp/connections", headers=mealie_auth)
         assert connections.status_code == 200
