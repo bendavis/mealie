@@ -8,7 +8,6 @@ on:
   push:
     branches:
       - feature/native-mcp
-      - mealie-next
     tags:
       - "v*"
     paths-ignore:
