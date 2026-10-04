@@ -88,9 +88,8 @@ def public_base_url() -> str:
     """Return a stable, externally configured origin and optional install prefix."""
     value = get_app_settings().BASE_URL.rstrip("/")
     parts = urlsplit(value)
-    loopback = parts.hostname in {"localhost", "127.0.0.1", "::1"}
     if (
-        parts.scheme not in ({"http", "https"} if loopback else {"https"})
+        parts.scheme not in {"http", "https"}
         or not parts.hostname
         or parts.username
         or parts.password
@@ -98,13 +97,15 @@ def public_base_url() -> str:
         or parts.fragment
         or "//" in parts.path
     ):
-        raise ValueError("BASE_URL must be a public HTTPS URL (or loopback HTTP for local development)")
+        raise ValueError("BASE_URL must be an absolute HTTP or HTTPS URL without credentials or a query")
     return value
 
 
 def validate_enablement_url() -> str:
     url = public_base_url()
-    if PRODUCTION and not TESTING and urlsplit(url).scheme != "https":
+    parts = urlsplit(url)
+    loopback = parts.hostname in {"localhost", "127.0.0.1", "::1"}
+    if parts.scheme != "https" and (not loopback or (PRODUCTION and not TESTING)):
         raise ValueError("Set BASE_URL to the public HTTPS Mealie URL before enabling MCP")
     return url + "/mcp"
 
@@ -119,7 +120,13 @@ def issuer_url() -> str:
 
 def mcp_enabled(session: Session) -> bool:
     row = session.get(McpSetting, 1)
-    return bool(row and row.enabled)
+    if not row or not row.enabled:
+        return False
+    try:
+        validate_enablement_url()
+    except ValueError:
+        return False
+    return True
 
 
 def _active_user(session: Session, grant: McpGrant) -> User | None:

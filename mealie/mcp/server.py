@@ -28,9 +28,24 @@ from mealie.mcp.oauth import (
 )
 
 provider = MealieOAuthProvider()
+
+
+def _startup_base_url() -> str:
+    """Keep ordinary Mealie available while an invalid MCP base URL is disabled."""
+    try:
+        configured = public_base_url()
+        parts = urlsplit(configured)
+        if parts.scheme == "https" or parts.hostname in {"localhost", "127.0.0.1", "::1"}:
+            return configured
+    except ValueError:
+        pass
+    return "http://localhost:8080"
+
+
+_base_url = _startup_base_url()
 auth_settings = AuthSettings(
-    issuer_url=AnyHttpUrl(issuer_url()),
-    resource_server_url=AnyHttpUrl(mcp_url()),
+    issuer_url=AnyHttpUrl(_base_url + "/oauth"),
+    resource_server_url=AnyHttpUrl(_base_url + "/mcp"),
     validate_token_resource=True,
     required_scopes=[],
     client_registration_options=ClientRegistrationOptions(
@@ -105,11 +120,11 @@ def _challenge(status: int, scope: str | None = None) -> Response:
 
 
 def _metadata_path(kind: str, suffix: str) -> str:
-    return f"/.well-known/{kind}{urlsplit(public_base_url()).path.rstrip('/')}{suffix}"
+    return f"/.well-known/{kind}{urlsplit(_base_url).path.rstrip('/')}{suffix}"
 
 
 def _metadata_url(kind: str, suffix: str) -> str:
-    parts = urlsplit(public_base_url())
+    parts = urlsplit(_base_url)
     return f"{parts.scheme}://{parts.netloc}{_metadata_path(kind, suffix)}"
 
 
@@ -223,8 +238,8 @@ def register_mcp_routes(app: FastAPI) -> None:
     from mealie.mcp.consent import router as consent_router
 
     app.include_router(consent_router)
-    host = urlsplit(public_base_url()).netloc
-    origin = f"{urlsplit(public_base_url()).scheme}://{host}"
+    host = urlsplit(_base_url).netloc
+    origin = f"{urlsplit(_base_url).scheme}://{host}"
     sdk_app = mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,

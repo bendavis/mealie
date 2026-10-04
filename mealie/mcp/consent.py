@@ -219,7 +219,11 @@ def update_admin_mcp_settings(
             raise HTTPException(400, str(exc)) from exc
     set_mcp_enabled(session, data.enabled)
     logger.info("MCP feature %s by administrator %s", "enabled" if data.enabled else "disabled", user.id)
-    return {"enabled": mcp_enabled(session), "url": validate_enablement_url() if data.enabled else mcp_url()}
+    try:
+        url = validate_enablement_url()
+    except ValueError:
+        url = None
+    return {"enabled": mcp_enabled(session), "url": url}
 
 
 @router.get("/api/users/mcp/connections")
