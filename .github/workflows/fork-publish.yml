@@ -1,0 +1,81 @@
+name: Publish Fork Image to Docker Hub
+
+# Builds the Mealie image from this fork and pushes it to Docker Hub.
+# Required repo secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (a Docker Hub access token).
+# Optional repo variable: DOCKERHUB_IMAGE (defaults to <github owner>/mealie).
+
+on:
+  push:
+    branches:
+      - feature/native-mcp
+      - mealie-next
+    tags:
+      - "v*"
+    paths-ignore:
+      - "*.md"
+      - ".devcontainer/**"
+      - ".vscode/**"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Target platforms"
+        required: false
+        default: "linux/amd64"
+
+concurrency:
+  group: fork-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || format('{0}/mealie', github.repository_owner) }}
+
+jobs:
+  publish:
+    name: Build and push
+    # Never run in the upstream repository
+    if: github.repository_owner != 'mealie-recipes'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/feature/native-mcp' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
