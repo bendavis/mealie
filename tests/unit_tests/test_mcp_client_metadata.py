@@ -102,3 +102,52 @@ def test_https_redirect_still_requires_exact_match():
     assert str(client.validate_redirect_uri(AnyUrl(REDIRECT))) == REDIRECT
     with pytest.raises(InvalidRedirectUriError):
         client.validate_redirect_uri(AnyUrl("https://chatgpt.com:8443/connector_platform_oauth_redirect"))
+
+
+def _serve_metadata(monkeypatch, payload: dict) -> list[httpx.Request]:
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=payload)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        oauth.socket, "getaddrinfo", lambda *_args, **_kwargs: [(socket.AF_INET, 0, 0, "", ("93.184.215.14", 443))]
+    )
+    monkeypatch.setattr(
+        oauth.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs)
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_cimd_without_application_type_allows_loopback(monkeypatch):
+    # Shape of the MCP specification's own client metadata document example
+    _serve_metadata(
+        monkeypatch,
+        {"client_id": CODEX_ID, "client_name": "Example", "redirect_uris": ["http://127.0.0.1:3000/callback"]},
+    )
+    client = await oauth._fetch_client_metadata(CODEX_ID)
+    assert client is not None
+    assert client.application_type == "native"
+
+
+@pytest.mark.asyncio
+async def test_cimd_metadata_is_cached_and_drops_unknown_scopes(monkeypatch):
+    oauth._client_metadata_cache.clear()
+    seen = _serve_metadata(
+        monkeypatch,
+        {
+            "client_id": CODEX_ID,
+            "application_type": "native",
+            "redirect_uris": ["http://127.0.0.1/callback"],
+            "scope": "openid offline_access recipes:read",
+        },
+    )
+    first = await oauth._cached_client_metadata(CODEX_ID)
+    second = await oauth._cached_client_metadata(CODEX_ID)
+    assert first is not None and second is first
+    assert first.scope == "recipes:read"
+    assert len(seen) == 1
+    oauth._client_metadata_cache.clear()

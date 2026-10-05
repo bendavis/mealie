@@ -6,7 +6,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI
-from mcp.server.auth.routes import build_metadata
+from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -21,6 +21,7 @@ from mealie.mcp.oauth import (
     INITIAL_SCOPES,
     SCOPES,
     MealieOAuthProvider,
+    canonical_resource,
     issuer_url,
     mcp_enabled,
     mcp_url,
@@ -50,7 +51,8 @@ auth_settings = AuthSettings(
     required_scopes=[],
     client_registration_options=ClientRegistrationOptions(
         enabled=True,
-        valid_scopes=list(SCOPES),
+        # Unknown scopes are dropped in register_client instead of failing registration
+        valid_scopes=None,
         default_scopes=list(SCOPES),
     ),
     revocation_options=RevocationOptions(enabled=True),
@@ -106,13 +108,15 @@ async def _buffer_request(receive: Receive, max_bytes: int = 4 * 1024 * 1024) ->
     return bytes(body), replay
 
 
-def _challenge(status: int, scope: str | None = None, request_id: str | int | None = None) -> Response:
+def _challenge(
+    status: int, scope: str | None = None, request_id: str | int | None = None, required: str | None = None
+) -> Response:
     fields = [f'resource_metadata="{_metadata_url("oauth-protected-resource", "/mcp")}"']
     if scope:
         fields.append(f'scope="{scope}"')
     if status == 403:
         fields.append('error="insufficient_scope"')
-        fields.append(f'error_description="The requested tool requires the {scope} scope"')
+        fields.append(f'error_description="The requested tool requires the {required or scope} scope"')
     else:
         fields.append('error="invalid_token"')
         fields.append('error_description="A valid MCP OAuth access token is required"')
@@ -205,7 +209,8 @@ class McpRouteAdapter:
                 fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
             except UnicodeDecodeError:
                 fields = {}
-            if self.public_path == "/oauth/token" and fields.get("resource") != [mcp_url()]:
+            resources = fields.get("resource", [])
+            if self.public_path == "/oauth/token" and any(canonical_resource(item) is None for item in resources):
                 return await JSONResponse(
                     {"error": "invalid_target", "error_description": "The resource must be this Mealie MCP URL"},
                     status_code=400,
@@ -249,7 +254,10 @@ class McpRouteAdapter:
                             request_id = request_json.get("id")
                             if isinstance(request_id, bool) or not isinstance(request_id, str | int):
                                 request_id = None
-                            return await _challenge(403, required, request_id)(scope, receive, send)
+                            # Ask for everything the token already has plus the new scope, so
+                            # clients that re-authorize with exactly this list don't lose access
+                            wanted = " ".join([*token.scopes, required])
+                            return await _challenge(403, wanted, request_id, required)(scope, receive, send)
                 except ValueError, AttributeError, TypeError:
                     pass
 
@@ -297,6 +305,10 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
     )
 
 
+async def _well_known_not_found(request: Request) -> JSONResponse:
+    return JSONResponse({"detail": "Not found"}, status_code=404)
+
+
 def register_mcp_routes(app: FastAPI) -> None:
     from mealie.mcp import tools as _tools  # noqa: F401
     from mealie.mcp.consent import router as consent_router
@@ -312,9 +324,14 @@ def register_mcp_routes(app: FastAPI) -> None:
             allowed_origins=[origin],
         ),
     )
-    app.add_route("/.well-known/oauth-authorization-server", authorization_metadata, methods=["GET"])
-    app.add_route(_metadata_path("oauth-authorization-server", "/oauth"), authorization_metadata, methods=["GET"])
-    app.add_route(_metadata_path("oauth-protected-resource", "/mcp"), protected_resource_metadata, methods=["GET"])
+    # Browser-based clients (e.g. MCP Inspector) preflight discovery requests
+    cors_methods = ["GET", "OPTIONS"]
+    for path, handler in (
+        ("/.well-known/oauth-authorization-server", authorization_metadata),
+        (_metadata_path("oauth-authorization-server", "/oauth"), authorization_metadata),
+        (_metadata_path("oauth-protected-resource", "/mcp"), protected_resource_metadata),
+    ):
+        app.router.routes.append(Route(path, endpoint=cors_middleware(handler, cors_methods), methods=cors_methods))
     for route in sdk_app.routes:
         if not isinstance(route, Route) or route.path in {
             "/.well-known/oauth-authorization-server",
@@ -327,3 +344,6 @@ def register_mcp_routes(app: FastAPI) -> None:
         app.router.routes.append(
             Route(public_path, endpoint=McpRouteAdapter(sdk_app, route.path, public_path), methods=route.methods)
         )
+    # Clients probe other discovery paths (openid-configuration, root protected resource) and
+    # need a 404 to fall back from, not the SPA's HTML page
+    app.router.routes.append(Route("/.well-known/{path:path}", endpoint=_well_known_not_found, methods=cors_methods))

@@ -5,7 +5,7 @@ import json
 import logging
 import secrets
 from datetime import UTC
-from urllib.parse import quote
+from urllib.parse import SplitResult, quote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -41,6 +41,12 @@ SCOPE_LABELS = {
     "shopping:read": "Read your household shopping lists",
     "shopping:write": "Change items on your household shopping lists",
 }
+
+
+def _csp_source(redirect: SplitResult) -> str:
+    if redirect.scheme in {"http", "https"}:
+        return f"{redirect.scheme}://{redirect.netloc}"
+    return f"{redirect.scheme}:"
 
 
 def _pending(session: Session, request_secret: str) -> McpAuthorizationRequest:
@@ -82,6 +88,13 @@ async def consent_page(request: Request, session: Session = Depends(generate_ses
     params = AuthorizationParams.model_validate_json(pending.params_json)
     csrf = secrets.token_urlsafe(32)
     client_name = html.escape(client.client_name or client.client_id)
+    redirect = urlsplit(str(params.redirect_uri))
+    redirect_target = html.escape(redirect.netloc or f"{redirect.scheme}:")
+    # Self-registered clients can claim any name; a metadata URL client_id is vouched for by its domain
+    publisher = urlsplit(client.client_id).hostname if client.client_id.startswith("https://") else None
+    publisher_line = (
+        f"Published by {html.escape(publisher)}" if publisher else "This app registered itself and is not verified"
+    )
     scope_items = "".join(f"<li>{html.escape(SCOPE_LABELS.get(scope, scope))}</li>" for scope in params.scopes or [])
     body = f"""<!doctype html>
 <html lang="en">
@@ -97,6 +110,7 @@ button {{padding:.7rem 1.2rem;margin-right:.6rem}}
 </head>
 <body>
 <h1>Connect {client_name} to Mealie?</h1>
+<p>{publisher_line}. After you decide, you will be sent to <strong>{redirect_target}</strong>.</p>
 <p class="account">Account: {html.escape(user.email)}<br>Household: {html.escape(user.household)}</p>
 <p>This app is requesting permission to:</p>
 <ul>{scope_items}</ul>
@@ -114,7 +128,10 @@ button {{padding:.7rem 1.2rem;margin-right:.6rem}}
         headers={
             "Cache-Control": "no-store",
             "Content-Security-Policy": (
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'"
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+                # Chromium applies form-action to the redirect after the POST, so the client's
+                # callback must be allowed or Allow/Deny never reach it
+                f"form-action 'self' {_csp_source(redirect)}"
             ),
         },
     )
