@@ -27,7 +27,7 @@ from mcp.server.auth.provider import (
     TokenError,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import ValidationError
+from pydantic import AnyUrl, ValidationError
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -57,6 +57,7 @@ ACCESS_LIFETIME = timedelta(minutes=15)
 REFRESH_LIFETIME = timedelta(days=30)
 CODE_LIFETIME = timedelta(minutes=5)
 REQUEST_LIFETIME = timedelta(minutes=10)
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 logger = logging.getLogger("mealie.mcp")
 
 
@@ -157,10 +158,36 @@ def _redirect_allowed(uri: str, application_type: str | None) -> bool:
         return False
     if parts.scheme == "https":
         return True
-    if application_type == "native" and parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1", "::1"}:
+    if application_type == "native" and parts.scheme == "http" and parts.hostname in LOOPBACK_HOSTS:
         return True
     # Native custom-scheme callbacks do not send credentials to a network host.
     return application_type == "native" and parts.scheme not in {"http", "https"}
+
+
+def _loopback_redirect_registered(uri: str, registered: list[AnyUrl]) -> bool:
+    """RFC 8252 section 7.3: loopback redirects may use any port the native app chose at runtime."""
+    parts = urlsplit(uri)
+    if parts.scheme != "http" or parts.hostname not in LOOPBACK_HOSTS or parts.fragment or parts.username:
+        return False
+    for item in registered:
+        other = urlsplit(str(item))
+        if (other.scheme, other.hostname, other.path, other.query) == (
+            parts.scheme,
+            parts.hostname,
+            parts.path,
+            parts.query,
+        ):
+            return True
+    return False
+
+
+class McpClientInformation(OAuthClientInformationFull):
+    """Client metadata with loopback redirect matching that ignores the port."""
+
+    def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
+        if redirect_uri is not None and _loopback_redirect_registered(str(redirect_uri), self.redirect_uris or []):
+            return redirect_uri
+        return super().validate_redirect_uri(redirect_uri)
 
 
 def _validate_client(client: OAuthClientInformationFull) -> None:
@@ -226,7 +253,7 @@ async def _fetch_client_metadata(client_id: str) -> OAuthClientInformationFull |
                 return None
         elif payload.get("token_endpoint_auth_method", "none") != "none":
             return None
-        result = OAuthClientInformationFull.model_validate(
+        result = McpClientInformation.model_validate(
             {
                 **payload,
                 "client_id": client_id,
@@ -250,7 +277,7 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                     metadata = _client_cipher().decrypt(row.metadata_json.encode())
                 except InvalidToken:
                     return None
-                return OAuthClientInformationFull.model_validate_json(metadata)
+                return McpClientInformation.model_validate_json(metadata)
         return await _fetch_client_metadata(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:

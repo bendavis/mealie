@@ -143,10 +143,18 @@ def test_native_mcp_oauth_flow_and_switch():
         assert parse_qs(urlsplit(default_denial.headers["location"]).query)["error"] == ["access_denied"]
         wrong_redirect = client.get(
             "/oauth/authorize",
-            params={**auth_params, "redirect_uri": "http://127.0.0.1:5600/callback"},
+            params={**auth_params, "redirect_uri": "http://127.0.0.1:5599/other"},
             follow_redirects=False,
         )
         assert wrong_redirect.status_code == 400
+        # RFC 8252 section 7.3: native apps pick their loopback port at runtime
+        other_port = client.get(
+            "/oauth/authorize",
+            params={**auth_params, "redirect_uri": "http://127.0.0.1:5600/callback"},
+            follow_redirects=False,
+        )
+        assert other_port.status_code == 302
+        assert urlsplit(other_port.headers["location"]).path == "/oauth/consent"
         plain_pkce = client.get(
             "/oauth/authorize", params={**auth_params, "code_challenge_method": "plain"}, follow_redirects=False
         )
