@@ -17,7 +17,7 @@ from mealie.app import app
 from mealie.db.db_setup import session_context
 from mealie.db.models.server.mcp import McpToken
 from mealie.db.models.users.users import User
-from mealie.mcp.oauth import digest, utcnow
+from mealie.mcp.oauth import REFRESH_REUSE_GRACE, digest, utcnow
 from mealie.mcp.tools import TOOL_SCOPES
 
 RESOURCE = "http://localhost:8080/mcp"
@@ -92,6 +92,19 @@ def test_native_mcp_oauth_flow_and_switch():
         assert auth_metadata["issuer"] == "http://localhost:8080/oauth"
         assert "none" in auth_metadata["token_endpoint_auth_methods_supported"]
         assert auth_metadata["code_challenge_methods_supported"] == ["S256"]
+        preflight = client.options(
+            "/.well-known/oauth-protected-resource/mcp",
+            headers={
+                "Origin": "http://localhost:6274",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "mcp-protocol-version",
+            },
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers["access-control-allow-origin"] in ("*", "http://localhost:6274")
+        for probe in ("/.well-known/openid-configuration", "/.well-known/oauth-protected-resource"):
+            missing = client.get(probe)
+            assert missing.status_code == 404 and missing.headers["content-type"].startswith("application/json")
         assert client.get("/mcp").status_code == 401
         assert _tool(client, login.json()["access_token"], "get_profile").status_code == 401
         registration = client.post(
@@ -105,6 +118,17 @@ def test_native_mcp_oauth_flow_and_switch():
         )
         assert registration.status_code in (200, 201), registration.text
         client_id = registration.json()["client_id"]
+        extra_scopes = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Client asking for OIDC scopes",
+                "redirect_uris": ["http://127.0.0.1:5599/callback"],
+                "token_endpoint_auth_method": "none",
+                "application_type": "native",
+                "scope": "openid offline_access recipes:read",
+            },
+        )
+        assert extra_scopes.status_code in (200, 201), extra_scopes.text
 
         verifier = "test-verifier-for-mcp-oauth-pkce-12345678901234567890"
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
@@ -126,6 +150,10 @@ def test_native_mcp_oauth_flow_and_switch():
         assert default_authorization.status_code == 302, default_authorization.text
         default_consent = client.get(default_authorization.headers["location"])
         assert default_consent.status_code == 200
+        csp = default_consent.headers["content-security-policy"]
+        assert "form-action 'self' http://127.0.0.1:5599" in csp
+        assert "you will be sent to <strong>127.0.0.1:5599</strong>" in default_consent.text
+        assert "registered itself and is not verified" in default_consent.text
         assert "Read recipes" in default_consent.text
         assert "Read your household meal plan" in default_consent.text
         assert "Read your household shopping lists" in default_consent.text
@@ -155,6 +183,20 @@ def test_native_mcp_oauth_flow_and_switch():
         )
         assert other_port.status_code == 302
         assert urlsplit(other_port.headers["location"]).path == "/oauth/consent"
+        # Clients differ in how they send the resource indicator and which scopes they ask for
+        for variant in (
+            {"resource": None},
+            {"resource": RESOURCE + "/"},
+            {"resource": RESOURCE.removesuffix("/mcp")},
+            {"scope": "openid profile:read recipes:read offline_access"},
+        ):
+            variant_params = {key: value for key, value in {**auth_params, **variant}.items() if value is not None}
+            response = client.get("/oauth/authorize", params=variant_params, follow_redirects=False)
+            assert urlsplit(response.headers["location"]).path == "/oauth/consent", variant
+        wrong_resource = client.get(
+            "/oauth/authorize", params={**auth_params, "resource": "https://wrong.example/mcp"}, follow_redirects=False
+        )
+        assert parse_qs(urlsplit(wrong_resource.headers["location"]).query)["error"] == ["invalid_target"]
         plain_pkce = client.get(
             "/oauth/authorize", params={**auth_params, "code_challenge_method": "plain"}, follow_redirects=False
         )
@@ -184,7 +226,8 @@ def test_native_mcp_oauth_flow_and_switch():
             == 400
         )
         assert client.post("/oauth/token", data={**token_fields, "code_verifier": "wrong"}).status_code == 400
-        tokens = client.post("/oauth/token", data=token_fields)
+        # The resource indicator is optional at the token endpoint
+        tokens = client.post("/oauth/token", data={k: v for k, v in token_fields.items() if k != "resource"})
         assert tokens.status_code == 200, tokens.text
         access = tokens.json()["access_token"]
         assert client.post("/oauth/token", data=token_fields).status_code == 400  # one-time code
@@ -205,7 +248,8 @@ def test_native_mcp_oauth_flow_and_switch():
             client, access, "add_shopping_item", {"list_id": "00000000-0000-0000-0000-000000000000", "note": "Milk"}
         )
         assert denied.status_code == 403
-        assert 'scope="shopping:write"' in denied.headers["www-authenticate"]
+        # Step-up keeps the scopes already granted so re-authorizing doesn't drop read access
+        assert 'scope="profile:read recipes:read shopping:write"' in denied.headers["www-authenticate"]
         assert denied.json()["result"]["_meta"]["mcp/www_authenticate"] == [denied.headers["www-authenticate"]]
         assert client.get("/api/users/self", headers={"Authorization": f"Bearer {access}"}).status_code == 401
         read_grant_id = client.get("/api/users/mcp/connections").json()[0]["id"]
@@ -396,6 +440,14 @@ def test_native_mcp_oauth_flow_and_switch():
         assert rotated.status_code == 200, rotated.text
         reused = client.post("/oauth/token", data=refresh_fields)
         assert reused.status_code == 400
+        # An immediate replay (client retry, concurrent refresh) is refused without revoking the grant
+        assert _tool(client, rotated.json()["access_token"], "get_profile").status_code == 200
+        with session_context() as session:
+            session.query(McpToken).filter_by(token_hash=digest(refresh_fields["refresh_token"])).update(
+                {McpToken.used_at: utcnow() - REFRESH_REUSE_GRACE - timedelta(seconds=1)}
+            )
+            session.commit()
+        assert client.post("/oauth/token", data=refresh_fields).status_code == 400
         assert _tool(client, write_access, "get_profile").status_code == 401
         assert _tool(client, rotated.json()["access_token"], "get_profile").status_code == 401
 

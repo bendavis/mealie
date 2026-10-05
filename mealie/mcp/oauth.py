@@ -11,9 +11,11 @@ import json
 import logging
 import secrets
 import socket
+import time
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 
+import anyio.to_thread
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from mcp.server.auth.provider import (
@@ -57,6 +59,10 @@ ACCESS_LIFETIME = timedelta(minutes=15)
 REFRESH_LIFETIME = timedelta(days=30)
 CODE_LIFETIME = timedelta(minutes=5)
 REQUEST_LIFETIME = timedelta(minutes=10)
+# A client that retries a refresh, or two processes sharing credentials, can present a
+# refresh token again moments after it was rotated. That is not theft, so don't revoke.
+REFRESH_REUSE_GRACE = timedelta(seconds=60)
+CLIENT_METADATA_TTL = 300
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 logger = logging.getLogger("mealie.mcp")
 
@@ -113,6 +119,23 @@ def validate_enablement_url() -> str:
 
 def mcp_url() -> str:
     return public_base_url() + "/mcp"
+
+
+def canonical_resource(value: str | None) -> str | None:
+    """Map the resource indicators clients send for this server onto the MCP URL.
+
+    Clients variously omit the RFC 8707 resource, add a trailing slash, or send the
+    site origin. Anything naming a different resource returns None.
+    """
+    target = mcp_url()
+    if value is None:
+        return target
+    return target if value.rstrip("/") in {target, public_base_url()} else None
+
+
+def known_scopes(requested: str | None) -> list[str]:
+    """Drop scopes Mealie does not define (openid, offline_access, ...); RFC 6749 section 3.3 allows granting fewer."""
+    return [scope for scope in (requested or "").split() if scope in SCOPES]
 
 
 def issuer_url() -> str:
@@ -189,6 +212,10 @@ class McpClientInformation(OAuthClientInformationFull):
             return redirect_uri
         return super().validate_redirect_uri(redirect_uri)
 
+    def validate_scope(self, requested_scope: str | None) -> list[str] | None:
+        scopes = known_scopes(requested_scope)
+        return super().validate_scope(" ".join(scopes)) if scopes else None
+
 
 def _validate_client(client: OAuthClientInformationFull) -> None:
     if client.client_name and len(client.client_name) > 255:
@@ -199,8 +226,6 @@ def _validate_client(client: OAuthClientInformationFull) -> None:
         raise RegistrationError(
             "invalid_redirect_uri", "Redirect URI must use HTTPS or a native loopback/custom scheme"
         )
-    if client.scope and not set(client.scope.split()).issubset(SCOPES):
-        raise RegistrationError("invalid_client_metadata", "Unsupported scope")
 
 
 async def _fetch_client_metadata(client_id: str) -> OAuthClientInformationFull | None:
@@ -218,7 +243,9 @@ async def _fetch_client_metadata(client_id: str) -> OAuthClientInformationFull |
             or parts.port not in (None, 443)
         ):
             return None
-        addresses = socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
+        addresses = await anyio.to_thread.run_sync(
+            lambda: socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
+        )
         if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
             return None
         address = ipaddress.ip_address(addresses[0][4][0])
@@ -259,13 +286,37 @@ async def _fetch_client_metadata(client_id: str) -> OAuthClientInformationFull |
                 "client_id": client_id,
                 "client_secret": None,
                 "token_endpoint_auth_method": "none",
-                "scope": payload.get("scope") or " ".join(SCOPES),
+                "scope": " ".join(known_scopes(payload.get("scope")) or SCOPES),
+                # Documents that omit application_type but use loopback or custom-scheme
+                # callbacks (as in the MCP spec's own example) are native apps
+                "application_type": payload.get("application_type")
+                or (
+                    "native"
+                    if any(not str(uri).startswith("https://") for uri in payload.get("redirect_uris") or [])
+                    else None
+                ),
             }
         )
         _validate_client(result)
         return result
     except OSError, httpx.HTTPError, ValueError, ValidationError, RegistrationError:
         return None
+
+
+_client_metadata_cache: dict[str, tuple[float, OAuthClientInformationFull]] = {}
+
+
+async def _cached_client_metadata(client_id: str) -> OAuthClientInformationFull | None:
+    """CIMD documents are fetched on every OAuth call otherwise; a slow or failing fetch would break refreshes."""
+    cached = _client_metadata_cache.get(client_id)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    client = await _fetch_client_metadata(client_id)
+    if client:
+        _client_metadata_cache[client_id] = (time.monotonic() + CLIENT_METADATA_TTL, client)
+    elif cached:
+        return cached[1]
+    return client
 
 
 class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
@@ -278,10 +329,11 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 except InvalidToken:
                     return None
                 return McpClientInformation.model_validate_json(metadata)
-        return await _fetch_client_metadata(client_id)
+        return await _cached_client_metadata(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         _validate_client(client_info)
+        client_info = client_info.model_copy(update={"scope": " ".join(known_scopes(client_info.scope) or SCOPES)})
         with _Session() as session:
             if not mcp_enabled(session):
                 raise RegistrationError("invalid_client_metadata", "MCP is disabled")
@@ -296,7 +348,8 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             session.commit()
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
-        if params.resource != mcp_url():
+        resource = canonical_resource(params.resource)
+        if resource is None:
             raise AuthorizeError("invalid_target", "The resource must be this Mealie MCP URL")
         scopes = params.scopes or list(INITIAL_SCOPES)
         if not set(scopes).issubset(SCOPES):
@@ -309,7 +362,7 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 McpAuthorizationRequest(
                     request_hash=digest(request_secret),
                     client_id=client.client_id,
-                    params_json=params.model_copy(update={"scopes": scopes}).model_dump_json(),
+                    params_json=params.model_copy(update={"scopes": scopes, "resource": resource}).model_dump_json(),
                     expires_at=utcnow() + REQUEST_LIFETIME,
                 )
             )
@@ -427,6 +480,8 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             )
             if not row:
                 raise TokenError("invalid_grant", "Unknown refresh token")
+            if row.used_at and utcnow() - row.used_at < REFRESH_REUSE_GRACE:
+                raise TokenError("invalid_grant", "Refresh token already rotated")
             if row.used_at:
                 session.query(McpToken).filter_by(family_id=row.family_id).update({McpToken.revoked_at: utcnow()})
                 grant = session.get(McpGrant, row.grant_id)
@@ -450,11 +505,9 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 update(McpToken).where(McpToken.id == row.id, McpToken.used_at.is_(None)).values(used_at=utcnow())
             )
             if result.rowcount != 1:
-                session.query(McpToken).filter_by(family_id=row.family_id).update({McpToken.revoked_at: utcnow()})
-                grant.revoked_at = utcnow()
-                session.commit()
-                logger.warning("MCP refresh token reuse revoked grant %s", grant.id)
-                raise TokenError("invalid_grant", "Refresh token reuse detected")
+                # A concurrent request rotated this token between our read and update
+                session.rollback()
+                raise TokenError("invalid_grant", "Refresh token already rotated")
             tokens = self._issue_tokens(session, grant, scopes, row.family_id)
             logger.info("MCP refresh token rotated for grant %s", grant.id)
             return tokens
