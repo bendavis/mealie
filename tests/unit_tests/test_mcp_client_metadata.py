@@ -4,6 +4,8 @@ import socket
 
 import httpx
 import pytest
+from mcp.shared.auth import InvalidRedirectUriError
+from pydantic import AnyUrl
 
 from mealie.mcp import oauth
 
@@ -53,3 +55,50 @@ async def test_cimd_rejects_private_dns_addresses(monkeypatch):
         oauth.socket, "getaddrinfo", lambda *_args, **_kwargs: [(socket.AF_INET, 0, 0, "", ("127.0.0.1", 443))]
     )
     assert await oauth._fetch_client_metadata(CLIENT_ID) is None
+
+
+CODEX_ID = "https://chatgpt.com/oauth/codex/client.json"
+
+
+def _codex_client() -> oauth.McpClientInformation:
+    return oauth.McpClientInformation.model_validate(
+        {
+            "client_id": CODEX_ID,
+            "application_type": "native",
+            "redirect_uris": ["http://127.0.0.1/callback", "http://localhost/callback"],
+            "token_endpoint_auth_method": "none",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "redirect",
+    ["http://127.0.0.1:58724/callback", "http://localhost:4000/callback", "http://127.0.0.1/callback"],
+)
+def test_loopback_redirect_accepts_any_port(redirect):
+    client = _codex_client()
+    assert str(client.validate_redirect_uri(AnyUrl(redirect))) == redirect
+
+
+@pytest.mark.parametrize(
+    "redirect",
+    [
+        "http://127.0.0.1:58724/other",
+        "http://192.168.1.10:58724/callback",
+        "https://127.0.0.1:58724/callback",
+        "http://127.0.0.1:58724/callback?next=x",
+        "http://evil.example:58724/callback",
+    ],
+)
+def test_loopback_redirect_still_requires_registered_host_and_path(redirect):
+    with pytest.raises(InvalidRedirectUriError):
+        _codex_client().validate_redirect_uri(AnyUrl(redirect))
+
+
+def test_https_redirect_still_requires_exact_match():
+    client = oauth.McpClientInformation.model_validate(
+        {"client_id": CLIENT_ID, "redirect_uris": [REDIRECT], "token_endpoint_auth_method": "none"}
+    )
+    assert str(client.validate_redirect_uri(AnyUrl(REDIRECT))) == REDIRECT
+    with pytest.raises(InvalidRedirectUriError):
+        client.validate_redirect_uri(AnyUrl("https://chatgpt.com:8443/connector_platform_oauth_redirect"))
