@@ -54,7 +54,6 @@ SCOPES = (
     "shopping:read",
     "shopping:write",
 )
-INITIAL_SCOPES = ("profile:read", "recipes:read", "mealplans:read", "shopping:read")
 ACCESS_LIFETIME = timedelta(minutes=15)
 REFRESH_LIFETIME = timedelta(days=30)
 CODE_LIFETIME = timedelta(minutes=5)
@@ -351,7 +350,7 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         resource = canonical_resource(params.resource)
         if resource is None:
             raise AuthorizeError("invalid_target", "The resource must be this Mealie MCP URL")
-        scopes = params.scopes or list(INITIAL_SCOPES)
+        scopes = params.scopes or list(SCOPES)
         if not set(scopes).issubset(SCOPES):
             raise AuthorizeError("invalid_scope", "Unsupported MCP scope")
         request_secret = secrets.token_urlsafe(32)
@@ -452,20 +451,14 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             if not row or row.revoked_at or row.expires_at <= utcnow():
                 return None
             grant = session.get(McpGrant, row.grant_id)
-            if (
-                not grant
-                or grant.revoked_at
-                or grant.client_id != client.client_id
-                or not mcp_enabled(session)
-                or not set(json.loads(row.scopes_json)).issubset(json.loads(grant.scopes_json))
-            ):
+            if not grant or grant.revoked_at or grant.client_id != client.client_id or not mcp_enabled(session):
                 return None
             if not _active_user(session, grant):
                 return None
             return RefreshToken(
                 token=refresh_token,
                 client_id=client.client_id,
-                scopes=json.loads(row.scopes_json),
+                scopes=json.loads(grant.scopes_json),
                 expires_at=int(row.expires_at.replace(tzinfo=UTC).timestamp()),
                 resource=mcp_url(),
                 subject=str(grant.user_id),
@@ -497,10 +490,10 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 raise TokenError("invalid_grant", "Grant revoked")
             if not _active_user(session, grant):
                 raise TokenError("invalid_grant", "Account unavailable")
-            if not set(json.loads(row.scopes_json)).issubset(json.loads(grant.scopes_json)):
-                raise TokenError("invalid_scope", "Grant scopes changed")
-            if not set(scopes).issubset(set(json.loads(row.scopes_json))):
-                raise TokenError("invalid_scope", "Cannot expand scopes during refresh")
+            # The user can change a connection's permissions in Mealie, so a refresh may
+            # pick up scopes the original token never had; it can't exceed the grant
+            if not set(scopes).issubset(json.loads(grant.scopes_json)):
+                raise TokenError("invalid_scope", "Scope not granted to this connection")
             result = session.execute(
                 update(McpToken).where(McpToken.id == row.id, McpToken.used_at.is_(None)).values(used_at=utcnow())
             )
@@ -518,19 +511,16 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             if not row or row.revoked_at or row.expires_at <= utcnow() or not mcp_enabled(session):
                 return None
             grant = session.get(McpGrant, row.grant_id)
-            if (
-                not grant
-                or grant.revoked_at
-                or not set(json.loads(row.scopes_json)).issubset(json.loads(grant.scopes_json))
-            ):
+            if not grant or grant.revoked_at:
                 return None
             user = _active_user(session, grant)
             if not user:
                 return None
+            # Permissions come from the grant, not the token, so edits in Connected apps apply immediately
             return AccessToken(
                 token=token,
                 client_id=grant.client_id,
-                scopes=json.loads(row.scopes_json),
+                scopes=json.loads(grant.scopes_json),
                 expires_at=int(row.expires_at.replace(tzinfo=UTC).timestamp()),
                 resource=mcp_url(),
                 subject=str(user.id),

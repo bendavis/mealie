@@ -17,7 +17,12 @@ from mealie.lang.providers import get_locale_provider
 from mealie.mcp.server import mcp
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
-from mealie.schema.household.group_shopping_list import ShoppingListItemCreate, ShoppingListItemUpdateBulk
+from mealie.schema.household.group_shopping_list import (
+    ShoppingListCreate,
+    ShoppingListItemCreate,
+    ShoppingListItemUpdateBulk,
+    ShoppingListOut,
+)
 from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.meal_plan.new_meal import PlanEntryType, SavePlanEntry
 from mealie.schema.recipe.recipe import CreateRecipe, RecipeSummary
@@ -40,6 +45,11 @@ TOOL_SCOPES = {
     "add_shopping_item": "shopping:write",
     "update_shopping_item": "shopping:write",
     "set_shopping_item_checked": "shopping:write",
+    "delete_shopping_item": "shopping:write",
+    "set_all_shopping_items_checked": "shopping:write",
+    "clear_checked_shopping_items": "shopping:write",
+    "create_shopping_list": "shopping:write",
+    "rename_shopping_list": "shopping:write",
 }
 
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
@@ -344,3 +354,91 @@ def update_shopping_item(item_id: str, note: str | None = None, quantity: float 
 )
 def set_shopping_item_checked(item_id: str, checked: bool) -> dict:
     return _update_item(item_id, checked=checked)
+
+
+def _shopping_list(repos: AllRepositories, list_id: str) -> ShoppingListOut:
+    found = repos.group_shopping_lists.get_one(UUID(list_id))
+    if not found:
+        raise ValueError("Shopping list not found")
+    return found
+
+
+def _list_name(name: str) -> str:
+    if not name.strip() or len(name) > 250:
+        raise ValueError("Shopping list name must be 1 to 250 characters")
+    return name.strip()
+
+
+@mcp.tool(
+    description="Remove an item from a household shopping list.",
+    annotations=UPDATE,
+    meta=_tool_meta("delete_shopping_item"),
+)
+def delete_shopping_item(item_id: str) -> dict:
+    with _context("shopping:write") as (user, repos, __):
+        if not repos.group_shopping_list_item.get_one(UUID(item_id)):
+            raise ValueError("Shopping item not found")
+        result = ShoppingListService(repos).bulk_delete_items([UUID(item_id)])
+        logger.info("MCP delete_shopping_item by user %s", user.id)
+        return result.model_dump(mode="json", by_alias=True)
+
+
+@mcp.tool(
+    description=(
+        "Check or uncheck every item on a household shopping list, e.g. to mark the whole list as done after shopping."
+    ),
+    annotations=UPDATE,
+    meta=_tool_meta("set_all_shopping_items_checked"),
+)
+def set_all_shopping_items_checked(list_id: str, checked: bool = True) -> dict:
+    with _context("shopping:write") as (user, repos, __):
+        shopping_list = _shopping_list(repos, list_id)
+        changes = [
+            ShoppingListItemUpdateBulk.model_validate({**item.model_dump(mode="python"), "checked": checked})
+            for item in shopping_list.list_items
+            if item.checked != checked
+        ]
+        result = ShoppingListService(repos).bulk_update_items(changes)
+        logger.info("MCP set_all_shopping_items_checked by user %s", user.id)
+        return result.model_dump(mode="json", by_alias=True)
+
+
+@mcp.tool(
+    description="Delete all checked items from a household shopping list.",
+    annotations=UPDATE,
+    meta=_tool_meta("clear_checked_shopping_items"),
+)
+def clear_checked_shopping_items(list_id: str) -> dict:
+    with _context("shopping:write") as (user, repos, __):
+        shopping_list = _shopping_list(repos, list_id)
+        checked = [item.id for item in shopping_list.list_items if item.checked]
+        result = ShoppingListService(repos).bulk_delete_items(checked)
+        logger.info("MCP clear_checked_shopping_items by user %s", user.id)
+        return result.model_dump(mode="json", by_alias=True)
+
+
+@mcp.tool(
+    description="Create a new household shopping list.",
+    annotations=WRITE,
+    meta=_tool_meta("create_shopping_list"),
+)
+def create_shopping_list(name: str) -> dict:
+    list_name = _list_name(name)
+    with _context("shopping:write") as (user, repos, __):
+        created = ShoppingListService(repos).create_one_list(ShoppingListCreate(name=list_name), user.id)
+        logger.info("MCP create_shopping_list by user %s", user.id)
+        return _summary(created)
+
+
+@mcp.tool(
+    description="Rename a household shopping list.",
+    annotations=UPDATE,
+    meta=_tool_meta("rename_shopping_list"),
+)
+def rename_shopping_list(list_id: str, name: str) -> dict:
+    list_name = _list_name(name)
+    with _context("shopping:write") as (user, repos, __):
+        shopping_list = _shopping_list(repos, list_id)
+        updated = repos.group_shopping_lists.patch(shopping_list.id, {"name": list_name})
+        logger.info("MCP rename_shopping_list by user %s", user.id)
+        return {"id": str(updated.id), "name": updated.name}

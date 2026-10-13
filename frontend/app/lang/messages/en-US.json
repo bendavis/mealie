@@ -1161,7 +1161,7 @@
   },
   "profile": {
     "connected-apps": "Connected apps",
-    "connected-apps-description": "Review and revoke AI clients connected through MCP.",
+    "connected-apps-description": "Review, change and revoke AI clients connected through MCP.",
     "connected-apps-intro": "These apps have been approved to access Mealie through MCP.",
     "connected-apps-permissions": "Permissions",
     "connected-apps-revoked": "Revoked",
@@ -1169,6 +1169,16 @@
     "connected-apps-empty": "No connected apps yet.",
     "connected-apps-load-error": "Could not load connected apps.",
     "connected-apps-revoke-error": "Could not revoke this app.",
+    "connected-apps-update-error": "Could not change this app's permissions.",
+    "connected-apps-scopes": {
+      "profile-read": "Identify your Mealie account and household",
+      "recipes-read": "Read recipes",
+      "recipes-write": "Create and edit recipes",
+      "mealplans-read": "Read your household meal plan",
+      "mealplans-write": "Change your household meal plan",
+      "shopping-read": "Read your household shopping lists",
+      "shopping-write": "Create and change your household shopping lists"
+    },
     "welcome-user": "👋 Welcome, {0}!",
     "description": "Manage your profile, recipes, and group settings.",
     "invite-link": "Invite Link",

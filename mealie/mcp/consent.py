@@ -18,6 +18,7 @@ from mealie.db.db_setup import generate_session
 from mealie.db.models.server.mcp import McpAuthorizationCode, McpAuthorizationRequest, McpClient, McpGrant, McpToken
 from mealie.mcp.oauth import (
     CODE_LIFETIME,
+    SCOPES,
     digest,
     issuer_url,
     mcp_enabled,
@@ -39,8 +40,10 @@ SCOPE_LABELS = {
     "mealplans:read": "Read your household meal plan",
     "mealplans:write": "Change your household meal plan",
     "shopping:read": "Read your household shopping lists",
-    "shopping:write": "Change items on your household shopping lists",
+    "shopping:write": "Create and change your household shopping lists",
 }
+# Every connection can identify its account; the rest are the user's choice
+REQUIRED_SCOPE = "profile:read"
 
 
 def _csp_source(redirect: SplitResult) -> str:
@@ -95,7 +98,15 @@ async def consent_page(request: Request, session: Session = Depends(generate_ses
     publisher_line = (
         f"Published by {html.escape(publisher)}" if publisher else "This app registered itself and is not verified"
     )
-    scope_items = "".join(f"<li>{html.escape(SCOPE_LABELS.get(scope, scope))}</li>" for scope in params.scopes or [])
+    # Offer every scope, ticked, even if the client asked for less: many clients never
+    # ask again for write access, so the user decides here and can change it later
+    scope_items = "".join(
+        f"<li>{html.escape(SCOPE_LABELS[scope])}</li>"
+        if scope == REQUIRED_SCOPE
+        else f'<li><label><input type="checkbox" name="scope" value="{scope}" checked> '
+        f"{html.escape(SCOPE_LABELS[scope])}</label></li>"
+        for scope in SCOPES
+    )
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -106,16 +117,18 @@ async def consent_page(request: Request, session: Session = Depends(generate_ses
 body {{font-family:system-ui,sans-serif;max-width:38rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}
 button {{padding:.7rem 1.2rem;margin-right:.6rem}}
 .account {{padding:1rem;background:#f4f4f4;border-radius:.5rem}}
+ul.scopes {{list-style:none;padding-left:0}}
+ul.scopes li {{margin:.3rem 0}}
 </style>
 </head>
 <body>
 <h1>Connect {client_name} to Mealie?</h1>
 <p>{publisher_line}. After you decide, you will be sent to <strong>{redirect_target}</strong>.</p>
 <p class="account">Account: {html.escape(user.email)}<br>Household: {html.escape(user.household)}</p>
-<p>This app is requesting permission to:</p>
-<ul>{scope_items}</ul>
-<p>You can revoke this connection later in Mealie's Connected apps settings.</p>
 <form method="post" action="{html.escape(public_base_url())}/oauth/consent">
+<p>Allow this app to:</p>
+<ul class="scopes">{scope_items}</ul>
+<p>You can change these permissions or revoke this connection later in Mealie's Connected apps settings.</p>
 <input type="hidden" name="request" value="{html.escape(request_secret)}">
 <input type="hidden" name="csrf" value="{html.escape(csrf)}">
 <button type="submit" name="decision" value="approve">Allow</button>
@@ -173,18 +186,20 @@ async def consent_decision(request: Request, session: Session = Depends(generate
             str(params.redirect_uri), error="access_denied", state=params.state, iss=issuer_url()
         )
     else:
+        chosen = set(form.getlist("scope")) | {REQUIRED_SCOPE}
+        scopes = [scope for scope in SCOPES if scope in chosen]
         grant = McpGrant(
             user_id=user.id,
             household_id=user.household_id,
             client_id=pending.client_id,
-            scopes_json=json.dumps(params.scopes or []),
+            scopes_json=json.dumps(scopes),
         )
         session.add(grant)
         session.flush()
         code = secrets.token_urlsafe(48)
         auth_code = AuthorizationCode(
             code=code,
-            scopes=params.scopes or [],
+            scopes=scopes,
             expires_at=(utcnow() + CODE_LIFETIME).replace(tzinfo=UTC).timestamp(),
             client_id=pending.client_id,
             code_challenge=params.code_challenge,
@@ -212,6 +227,10 @@ async def consent_decision(request: Request, session: Session = Depends(generate
 
 class McpSettingRequest(BaseModel):
     enabled: bool
+
+
+class McpConnectionUpdate(BaseModel):
+    scopes: list[str]
 
 
 @router.get("/api/admin/mcp")
@@ -275,3 +294,23 @@ def revoke_mcp_connection(
     session.commit()
     logger.info("MCP grant %s revoked by user %s", grant.id, user.id)
     return {"revoked": True}
+
+
+@router.put("/api/users/mcp/connections/{grant_id}")
+def update_mcp_connection(
+    grant_id: int,
+    data: McpConnectionUpdate,
+    user: PrivateUser = Depends(get_current_user),
+    session: Session = Depends(generate_session),
+):
+    grant = session.query(McpGrant).filter_by(id=grant_id, user_id=user.id).one_or_none()
+    if not grant or grant.revoked_at:
+        raise HTTPException(404)
+    if not set(data.scopes).issubset(SCOPES):
+        raise HTTPException(400, "Unsupported MCP scope")
+    chosen = set(data.scopes) | {REQUIRED_SCOPE}
+    scopes = [scope for scope in SCOPES if scope in chosen]
+    grant.scopes_json = json.dumps(scopes)
+    session.commit()
+    logger.info("MCP grant %s scopes changed by user %s", grant.id, user.id)
+    return {"id": grant.id, "scopes": scopes}

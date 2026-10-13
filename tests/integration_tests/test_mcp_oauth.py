@@ -68,6 +68,14 @@ def _list_tools(client: TestClient, token: str):
     )
 
 
+def _consent_form(page: str) -> dict:
+    """The consent form as a browser would submit it with the default ticks."""
+    soup = BeautifulSoup(page, "html.parser")
+    form: dict = {item["name"]: item["value"] for item in soup.select("input[type=hidden]")}
+    form["scope"] = [item["value"] for item in soup.select("input[name=scope][checked]")]
+    return form
+
+
 def _tool_result(response) -> dict:
     assert response.status_code == 200, response.text
     result = response.json()["result"]
@@ -154,16 +162,17 @@ def test_native_mcp_oauth_flow_and_switch():
         assert "form-action 'self' http://127.0.0.1:5599" in csp
         assert "you will be sent to <strong>127.0.0.1:5599</strong>" in default_consent.text
         assert "registered itself and is not verified" in default_consent.text
-        assert "Read recipes" in default_consent.text
-        assert "Read your household meal plan" in default_consent.text
-        assert "Read your household shopping lists" in default_consent.text
-        assert "Create and edit recipes" not in default_consent.text
-        assert "Change your household meal plan" not in default_consent.text
-        assert "Change items on your household shopping lists" not in default_consent.text
-        default_form = {
-            item["name"]: item["value"]
-            for item in BeautifulSoup(default_consent.text, "html.parser").select("input[type=hidden]")
-        }
+        # Every permission is offered and ticked, even when the client asked for nothing
+        default_form = _consent_form(default_consent.text)
+        assert default_form["scope"] == [
+            "recipes:read",
+            "recipes:write",
+            "mealplans:read",
+            "mealplans:write",
+            "shopping:read",
+            "shopping:write",
+        ]
+        assert "Create and change your household shopping lists" in default_consent.text
         default_denial = client.post(
             "/oauth/consent", data={**default_form, "decision": "deny"}, follow_redirects=False
         )
@@ -207,8 +216,8 @@ def test_native_mcp_oauth_flow_and_switch():
         consent = client.get(authorization.headers["location"])
         assert consent.status_code == 200
         assert "Read recipes" in consent.text
-        soup = BeautifulSoup(consent.text, "html.parser")
-        form = {item["name"]: item["value"] for item in soup.select("input[type=hidden]")}
+        # The user unticks everything except reading recipes
+        form = {**_consent_form(consent.text), "scope": ["recipes:read"]}
         assert client.post("/oauth/consent", data={**form, "csrf": "wrong", "decision": "approve"}).status_code == 403
         approval = client.post("/oauth/consent", data={**form, "decision": "approve"}, follow_redirects=False)
         assert approval.status_code == 302, approval.text
@@ -252,7 +261,22 @@ def test_native_mcp_oauth_flow_and_switch():
         assert 'scope="profile:read recipes:read shopping:write"' in denied.headers["www-authenticate"]
         assert denied.json()["result"]["_meta"]["mcp/www_authenticate"] == [denied.headers["www-authenticate"]]
         assert client.get("/api/users/self", headers={"Authorization": f"Bearer {access}"}).status_code == 401
-        read_grant_id = client.get("/api/users/mcp/connections").json()[0]["id"]
+        read_connection = client.get("/api/users/mcp/connections", headers=mealie_auth).json()[0]
+        read_grant_id = read_connection["id"]
+        assert read_connection["scopes"] == ["profile:read", "recipes:read"]
+
+        # Permissions edited in Mealie apply to the client's existing token straight away
+        connection_url = f"/api/users/mcp/connections/{read_grant_id}"
+        assert client.put(connection_url, json={"scopes": ["admin"]}, headers=mealie_auth).status_code == 400
+        widened = client.put(connection_url, json={"scopes": ["recipes:read", "shopping:read"]}, headers=mealie_auth)
+        assert widened.status_code == 200, widened.text
+        assert widened.json()["scopes"] == ["profile:read", "recipes:read", "shopping:read"]
+        _tool_result(_tool(client, access, "list_shopping_lists"))
+        narrowed = client.put(connection_url, json={"scopes": []}, headers=mealie_auth)
+        assert narrowed.json()["scopes"] == ["profile:read"]
+        assert _tool(client, access, "search_recipes").status_code == 403
+        _tool_result(_tool(client, access, "get_profile"))
+        assert client.put(connection_url, json={"scopes": ["recipes:read"]}, headers=mealie_auth).status_code == 200
 
         # A separate approval can add a write scope without changing the first grant.
         write_auth = client.get(
@@ -274,10 +298,7 @@ def test_native_mcp_oauth_flow_and_switch():
             follow_redirects=False,
         )
         write_consent = client.get(write_auth.headers["location"])
-        write_form = {
-            item["name"]: item["value"]
-            for item in BeautifulSoup(write_consent.text, "html.parser").select("input[type=hidden]")
-        }
+        write_form = _consent_form(write_consent.text)
         write_approval = client.post(
             "/oauth/consent", data={**write_form, "decision": "approve"}, follow_redirects=False
         )
@@ -296,6 +317,30 @@ def test_native_mcp_oauth_flow_and_switch():
         _tool_result(_tool(client, write_access, "set_shopping_item_checked", {"item_id": item_id, "checked": True}))
         _tool_result(_tool(client, write_access, "get_shopping_list", {"list_id": list_id}))
         _tool_result(_tool(client, write_access, "list_shopping_lists"))
+
+        created_list = _tool_result(_tool(client, write_access, "create_shopping_list", {"name": "MCP groceries"}))
+        new_list_id = created_list["id"]
+        renamed = _tool_result(
+            _tool(client, write_access, "rename_shopping_list", {"list_id": new_list_id, "name": "MCP weekly shop"})
+        )
+        assert renamed["name"] == "MCP weekly shop"
+        for note in ("Eggs", "Bread", "Butter"):
+            _tool_result(_tool(client, write_access, "add_shopping_item", {"list_id": new_list_id, "note": note}))
+        items = _tool_result(_tool(client, write_access, "get_shopping_list", {"list_id": new_list_id}))["listItems"]
+        assert len(items) == 3
+        removed = _tool_result(_tool(client, write_access, "delete_shopping_item", {"item_id": items[0]["id"]}))
+        assert [item["id"] for item in removed["deletedItems"]] == [items[0]["id"]]
+        _tool_result(_tool(client, write_access, "set_all_shopping_items_checked", {"list_id": new_list_id}))
+        items = _tool_result(_tool(client, write_access, "get_shopping_list", {"list_id": new_list_id}))["listItems"]
+        assert len(items) == 2 and all(item["checked"] for item in items)
+        _tool_result(
+            _tool(client, write_access, "set_shopping_item_checked", {"item_id": items[0]["id"], "checked": False})
+        )
+        cleared = _tool_result(_tool(client, write_access, "clear_checked_shopping_items", {"list_id": new_list_id}))
+        assert [item["id"] for item in cleared["deletedItems"]] == [items[1]["id"]]
+        items = _tool_result(_tool(client, write_access, "get_shopping_list", {"list_id": new_list_id}))["listItems"]
+        assert [item["id"] for item in items] == [items[0]["id"]]
+        assert _tool(client, write_access, "create_shopping_list", {"name": " "}).json()["result"]["isError"]
 
         recipe = _tool_result(_tool(client, write_access, "create_recipe", {"name": "MCP test recipe"}))
         _tool_result(_tool(client, write_access, "get_recipe", {"slug_or_id": recipe["slug"]}))
@@ -396,6 +441,16 @@ def test_native_mcp_oauth_flow_and_switch():
         assert _tool(
             client, write_access, "set_shopping_item_checked", {"item_id": other_item_id, "checked": True}
         ).json()["result"]["isError"]
+        for name, arguments in (
+            ("delete_shopping_item", {"item_id": other_item_id}),
+            ("set_all_shopping_items_checked", {"list_id": other_list_id}),
+            ("clear_checked_shopping_items", {"list_id": other_list_id}),
+            ("rename_shopping_list", {"list_id": other_list_id, "name": "Wrong"}),
+        ):
+            assert _tool(client, write_access, name, arguments).json()["result"]["isError"], name
+        assert client.get(f"/api/households/shopping/items/{other_item_id}", headers=other_auth).status_code == 200
+        other_connection = client.put(connection_url, json={"scopes": ["recipes:write"]}, headers=other_auth)
+        assert other_connection.status_code == 404
 
         with session_context() as session:
             user_model = session.get(User, UUID(profile["id"]))
@@ -453,10 +508,7 @@ def test_native_mcp_oauth_flow_and_switch():
 
         revoke_authorization = client.get("/oauth/authorize", params=auth_params, follow_redirects=False)
         revoke_consent = client.get(revoke_authorization.headers["location"])
-        revoke_form = {
-            item["name"]: item["value"]
-            for item in BeautifulSoup(revoke_consent.text, "html.parser").select("input[type=hidden]")
-        }
+        revoke_form = _consent_form(revoke_consent.text)
         revoke_approval = client.post(
             "/oauth/consent", data={**revoke_form, "decision": "approve"}, follow_redirects=False
         )

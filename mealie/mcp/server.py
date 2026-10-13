@@ -18,7 +18,6 @@ from starlette.types import Message, Receive, Scope, Send
 
 from mealie.db.db_setup import session_context
 from mealie.mcp.oauth import (
-    INITIAL_SCOPES,
     SCOPES,
     MealieOAuthProvider,
     canonical_resource,
@@ -233,10 +232,10 @@ class McpRouteAdapter:
             header_map = {key.lower(): value for key, value in scope.get("headers", [])}
             bearer = header_map.get(b"authorization", b"").decode()
             if not bearer.lower().startswith("bearer "):
-                return await _challenge(401, " ".join(INITIAL_SCOPES))(scope, receive, send)
+                return await _challenge(401, " ".join(SCOPES))(scope, receive, send)
             token = await provider.load_access_token(bearer[7:])
             if token is None:
-                return await _challenge(401, " ".join(INITIAL_SCOPES))(scope, receive, send)
+                return await _challenge(401, " ".join(SCOPES))(scope, receive, send)
             if scope.get("method") == "POST":
                 buffered = await _buffer_request(receive)
                 if buffered is None:
