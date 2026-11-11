@@ -1,5 +1,4 @@
 import tempfile
-import zipfile
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -8,7 +7,7 @@ from mealie.services.scraper import cleaner
 
 from ._migration_base import BaseMigrator
 from .utils.migration_alias import MigrationAlias
-from .utils.migration_helpers import safe_local_path
+from .utils.migration_helpers import extract_zip, safe_local_path
 
 
 def clean_instructions(instructions: list[str]) -> list[str]:
@@ -87,8 +86,7 @@ class RecipeKeeperMigrator(BaseMigrator):
 
     def _migrate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with zipfile.ZipFile(self.archive) as zip_file:
-                zip_file.extractall(tmpdir)
+            extract_zip(self.archive, tmpdir)
 
             source_dir = self.get_zip_base_path(Path(tmpdir))
 
@@ -101,7 +99,7 @@ class RecipeKeeperMigrator(BaseMigrator):
             recipes = [self.clean_recipe_dictionary(x) for x in recipes_as_dicts]
             results = self.import_recipes_to_database(recipes)
             for (slug, recipe_id, status), recipe in zip(results, recipes, strict=False):
-                if status:
+                if status and recipe_id:
                     try:
                         if not recipe or not recipe.image:
                             continue

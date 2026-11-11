@@ -65,7 +65,7 @@ async def _browser_user(request: Request, session: Session) -> PrivateUser | Non
     if "mealie.access_token" not in request.cookies:
         return None
     try:
-        return await get_current_user(token=request.cookies["mealie.access_token"], session=session)
+        return get_current_user(token=request.cookies["mealie.access_token"], session=session)
     except HTTPException:
         return None
 

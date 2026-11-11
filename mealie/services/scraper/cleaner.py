@@ -12,7 +12,7 @@ from slugify import slugify
 
 from mealie.core.root_logger import get_logger
 from mealie.lang.providers import Translator, get_all_translations
-from mealie.schema.recipe.recipe import MAX_DURATION_SECONDS, Recipe
+from mealie.schema.recipe.recipe import MAX_DURATION_SECONDS, RecipeDraft
 from mealie.services.parser_services.parser_utils import extract_quantity_from_string
 
 logger = get_logger("recipe-scraper")
@@ -27,8 +27,17 @@ MATCH_NUMBER = re.compile(r"\d+(?:\.\d+)?")
 MATCH_DIGITS = re.compile(r"\d+([.,]\d+)?")
 """ Allow for commas as decimals (common in Europe) """
 
+MATCH_GRAMS = re.compile(r"\d\s*(?:g|gm|gr|grams?)\b", re.IGNORECASE)
+""" A quantity in grams, e.g. `0.5 g`, `10g` or `2 grams`, but not `500 mg` """
+
 MATCH_HTML_TAGS = re.compile(r"<[^<]+?>")
 """ Matches HTML tags `<p>Text</p>` -> `Text` """
+
+MATCH_LINE_BREAK_TAGS = re.compile(r"</p\s*>|<br\s*/?>", re.IGNORECASE)
+""" Matches tags that end a line `</p>`, `<br>`, `<br/>` """
+
+MATCH_SPACES_AROUND_NEWLINE = re.compile(r" *\n *")
+""" Matches spaces next to a new line `Text \n Text` -> `Text\nText` """
 
 MATCH_MULTI_SPACE = re.compile(r" +")
 """ Matches multiple spaces `Hello    World` -> `Hello World` """
@@ -37,7 +46,7 @@ MATCH_ERRONEOUS_WHITE_SPACE = re.compile(r"\n\s*\n")
 """ Matches multiple new lines and removes erroneous white space """
 
 
-def clean(recipe_data: Recipe | dict, translator: Translator, url=None) -> Recipe:
+def clean(recipe_data: RecipeDraft | dict, translator: Translator, url=None) -> RecipeDraft:
     """Main entrypoint to clean a recipe extracted from the web
     and format the data into an accectable format for the database
 
@@ -82,7 +91,7 @@ def clean(recipe_data: Recipe | dict, translator: Translator, url=None) -> Recip
     recipe_data["notes"] = clean_notes(recipe_data.get("notes"))
     recipe_data["rating"] = clean_int(recipe_data.get("rating"))
 
-    return Recipe(**recipe_data)
+    return RecipeDraft(**recipe_data)
 
 
 def clean_string(text: str | list | int | float) -> str:
@@ -104,12 +113,14 @@ def clean_string(text: str | list | int | float) -> str:
     text = typing.cast(str, text)  # at this point we know text is a string
 
     cleaned_text = html.unescape(text)
+    cleaned_text = MATCH_LINE_BREAK_TAGS.sub("\n", cleaned_text)
     cleaned_text = MATCH_HTML_TAGS.sub("", cleaned_text)
+    cleaned_text = cleaned_text.replace("\xa0", " ").replace("\t", " ")
     cleaned_text = MATCH_MULTI_SPACE.sub(" ", cleaned_text)
+    cleaned_text = MATCH_SPACES_AROUND_NEWLINE.sub("\n", cleaned_text)
     cleaned_text = MATCH_ERRONEOUS_WHITE_SPACE.sub("\n\n", cleaned_text)
 
-    cleaned_text = cleaned_text.replace("</p>", "\n").replace("\xa0", " ").replace("\t", " ").strip()
-    return cleaned_text
+    return cleaned_text.strip()
 
 
 def clean_image(image: str | list | dict | None = None, default: str = NO_IMAGE) -> list[str]:
@@ -336,12 +347,27 @@ def _sanitize_instruction_text(line: str | dict) -> str:
     return clean_line
 
 
+def unwrap_text_node(value: typing.Any) -> typing.Any:
+    """
+    schema.org permits any Text subtype wherever a plain string is expected, so an
+    ingredient may arrive as `{"@type": "PronounceableText", "textValue": "1 cup flour"}`
+    rather than `"1 cup flour"`. Instacart emits these. Returns the inner string when the
+    value is such a wrapper, otherwise returns it untouched.
+    """
+    if isinstance(value, dict) and "textValue" in value:
+        text = value.get("textValue")
+        if isinstance(text, str):
+            return text
+    return value
+
+
 def clean_ingredients(ingredients: list | str | None, default: list | None = None) -> list[str | dict]:
     """
     ingredient attempts to parse the ingredients field from a recipe and return a list of
 
     Supported Structures:
         - `["1 cup flour"]` - A list of strings
+        - `[{"@type": "PronounceableText", "textValue": "1 cup flour"}]` - schema.org Text nodes
         - `"1 cup flour"` - A string
         - `None` - returns an empty list
 
@@ -354,6 +380,7 @@ def clean_ingredients(ingredients: list | str | None, default: list | None = Non
         case list(ingredients):
             cleaned_ingredients: list[str | dict] = []
             for ing in ingredients:
+                ing = unwrap_text_node(ing)
                 if isinstance(ing, dict):
                     cleaned_ingredients.append({clean_string(k): clean_string(v) for k, v in ing.items()})
                 else:
@@ -681,8 +708,10 @@ def clean_nutrition(nutrition: dict | None) -> dict[str, str]:
                 output_nutrition[key] = matched_digits.group(0).replace(",", ".")
 
     for key in ["sodiumContent", "cholesterolContent"]:
+        if key not in output_nutrition:
+            continue
         if val := nutrition.get(key, None):
-            if isinstance(val, str) and "m" not in val and "g" in val:
+            if isinstance(val, str) and MATCH_GRAMS.search(val):
                 with contextlib.suppress(AttributeError, TypeError):
                     output_nutrition[key] = str(float(output_nutrition[key]) * 1000)
 

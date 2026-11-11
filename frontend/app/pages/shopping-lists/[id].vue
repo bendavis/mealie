@@ -189,32 +189,18 @@
         :labels="allLabels || []"
         :units="allUnits || []"
         :foods="allFoods || []"
-        @cancel="createEditorOpen = false"
         @save="createListItem"
       />
 
-      <div v-else class="mb-3">
-        <ShoppingListItemEditor
-          v-if="createEditorOpen"
-          v-model="createListItemData"
-          class="my-4"
-          :labels="allLabels || []"
-          :units="allUnits || []"
-          :foods="allFoods || []"
-          :allow-delete="false"
-          @delete="createEditorOpen = false"
-          @cancel="createEditorOpen = false"
-          @save="createListItem"
-        />
-        <InputLabelType
-          v-else
-          :items="allFoods"
-          :label="$t('shopping-list.add-item')"
-          :icon="$globals.icons.foods"
-          search
-          @focus="createEditorOpen = true"
-        />
-      </div>
+      <ShoppingListQuickAdd
+        v-else
+        v-model="createListItemData"
+        class="mb-3"
+        :foods="allFoods || []"
+        :labels="allLabels || []"
+        :units="allUnits || []"
+        @save="createListItem"
+      />
 
       <TransitionGroup name="scroll-x-transition">
         <template v-for="(value, key) in itemsByLabel" :key="key">
@@ -364,7 +350,7 @@
                 flat
                 class="bg-transparent"
                 :disabled="isOffline"
-                @click.prevent="removeRecipeReferenceToList(recipe.id!)"
+                @click.prevent="removeRecipeReferenceToList(recipe.id)"
               >
                 <v-icon color="grey-lighten-1">
                   {{ $globals.icons.minus }}
@@ -380,7 +366,7 @@
                 :disabled="isOffline"
                 flat
                 class="bg-transparent"
-                @click.prevent="addRecipeReferenceToList(recipe.id!)"
+                @click.prevent="addRecipeReferenceToList(recipe.id)"
               >
                 <v-icon color="grey-lighten-1">
                   {{ $globals.icons.createAlt }}
@@ -400,8 +386,8 @@ import { VueDraggable } from "vue-draggable-plus";
 import RecipeList from "~/components/Domain/Recipe/RecipeList.vue";
 import MultiPurposeLabelSection from "~/components/Domain/ShoppingList/MultiPurposeLabelSection.vue";
 import ShoppingListAddItemForm from "~/components/Domain/ShoppingList/ShoppingListAddItemForm.vue";
+import ShoppingListQuickAdd from "~/components/Domain/ShoppingList/ShoppingListQuickAdd.vue";
 import ShoppingListItem from "~/components/Domain/ShoppingList/ShoppingListItem.vue";
-import ShoppingListItemEditor from "~/components/Domain/ShoppingList/ShoppingListItemEditor.vue";
 import { useShoppingListPage } from "~/composables/shopping-list-page/use-shopping-list-page";
 import { useLabelStore, useUnitStore, useFoodStore } from "~/composables/store";
 import { alert } from "~/composables/use-toast";
@@ -463,7 +449,6 @@ const {
   copyListItems,
   toggleReorderLabelsDialog,
   isOffline,
-  createEditorOpen,
   createListItemData,
   createListItem,
   itemsByLabel,
@@ -490,6 +475,13 @@ const {
   visibleCheckedCount,
   hasSearchResults,
 } = shoppingListPage;
+
+// Once per streak of failures: the items stay queued and look saved, so this is the only sign they aren't
+watch(shoppingListPage.hasFailedWrites, (failed) => {
+  if (failed) {
+    alert.error(i18n.t("shopping-list.changes-not-saved"));
+  }
+});
 
 // Expand the checked section while searching, so an item that has already been
 // checked off can be found and unchecked without expanding the section by hand.
@@ -572,7 +564,7 @@ watch(isSearching, (searching) => {
     height: 28px;
   }
 
-  .shopping-list-item-row .v-btn--size-small {
+  .shopping-list-item-row .v-btn--icon.v-btn--size-small {
     width: 32px;
     height: 32px;
     margin-left: 0 !important;

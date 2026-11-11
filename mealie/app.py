@@ -19,8 +19,10 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from mealie.core.config import get_app_settings
 from mealie.core.root_logger import get_logger
+from mealie.core.settings import branding
 from mealie.core.settings.static import APP_VERSION
 from mealie.mcp.server import mcp, register_mcp_routes
+from mealie.middleware.body_size_limit import BodySizeLimitMiddleware
 from mealie.middleware.locale_context import LocaleContextMiddleware
 from mealie.routes import router, spa, utility_routes
 from mealie.routes.handlers import register_debug_handler
@@ -91,6 +93,12 @@ async def lifespan_fn(_: FastAPI) -> AsyncGenerator[None]:
     logger.info(settings.OIDC_FEATURE)
     logger.info("------------------------")
 
+    if settings.branding.logo_path and not settings.branding.logo_file:
+        logger.warning(
+            f'BRANDING_LOGO_PATH="{settings.branding.logo_path}" is not a readable image file '
+            f"({', '.join(sorted(branding.ALLOWED_IMAGE_SUFFIXES))}); falling back to the default logo"
+        )
+
     async with mcp.session_manager.run():
         yield
 
@@ -105,9 +113,11 @@ app = FastAPI(
     lifespan=lifespan_fn,
 )
 
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# Level 9 (Starlette's default) took ~2.5x the CPU of level 6 on recipe list pages for ~4% smaller output
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
 app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
 app.add_middleware(LocaleContextMiddleware)
+app.add_middleware(BodySizeLimitMiddleware, max_body_size=settings.MAX_UPLOAD_SIZE_MB * 1024**2)
 
 if not settings.PRODUCTION:
     allowed_origins = ["http://localhost:3000"]

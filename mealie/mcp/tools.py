@@ -23,9 +23,9 @@ from mealie.schema.household.group_shopping_list import (
     ShoppingListItemUpdateBulk,
     ShoppingListOut,
 )
-from mealie.schema.household.household import HouseholdInDB
-from mealie.schema.meal_plan.new_meal import PlanEntryType, SavePlanEntry
-from mealie.schema.recipe.recipe import CreateRecipe, RecipeSummary
+from mealie.schema.household.household import HouseholdOut
+from mealie.schema.meal_plan.new_meal import PlanEntrySave, PlanEntryType
+from mealie.schema.recipe.recipe import RecipeCreate, RecipeDraft, RecipeSummary
 from mealie.schema.response.pagination import PaginationQuery
 from mealie.schema.user import PrivateUser
 from mealie.services.household_services.shopping_lists import ShoppingListService
@@ -75,7 +75,7 @@ def _tool_meta(name: str) -> dict[str, Any]:
 
 
 @contextmanager
-def _context(required_scope: str) -> Iterator[tuple[PrivateUser, AllRepositories, HouseholdInDB]]:
+def _context(required_scope: str) -> Iterator[tuple[PrivateUser, AllRepositories, HouseholdOut]]:
     token = get_access_token()
     if not token or required_scope not in token.scopes or not token.subject:
         raise PermissionError(f"Missing required MCP scope: {required_scope}")
@@ -166,7 +166,7 @@ def create_recipe(name: str) -> dict:
         raise ValueError("Recipe name must be 1 to 250 characters")
     with _context("recipes:write") as (user, repos, household):
         recipe = RecipeService(repos, user, household, get_locale_provider("en-US")).create_one(
-            CreateRecipe(name=name.strip())
+            RecipeCreate(name=name.strip())
         )
         logger.info("MCP create_recipe by user %s", user.id)
         return {
@@ -197,7 +197,7 @@ def update_recipe(slug_or_id: str, name: str | None = None, description: str | N
             changes["name"] = name.strip()
         if description is not None:
             changes["description"] = description
-        updated = service.update_one(existing.slug, existing.model_copy(update=changes))
+        updated = service.update_one(existing.slug, RecipeDraft.model_validate({**existing.model_dump(), **changes}))
         logger.info("MCP update_recipe by user %s", user.id)
         return {"id": str(updated.id), "slug": updated.slug, "name": updated.name}
 
@@ -238,7 +238,7 @@ def add_meal_plan_entry(
         if recipe_uuid and not repos.recipes.get_one(recipe_uuid, "id"):
             raise ValueError("Recipe not found in this household")
         item = repos.meals.create(
-            SavePlanEntry(
+            PlanEntrySave(
                 date=date,
                 title=title,
                 recipe_id=recipe_uuid,

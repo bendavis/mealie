@@ -347,6 +347,8 @@ const appConfig = ref<CheckApp>({
   ldapDisabled: false,
   oidcReady: false,
   oidcDisabled: false,
+  reverseProxyAuthReady: false,
+  reverseProxyAuthDisabled: false,
 });
 const adminStats = ref<AppStatistics>({
   totalRecipes: 0,
@@ -550,6 +552,13 @@ const simpleChecks = computed<SimpleCheck[]>(() => {
       envVar: "OIDC_AUTH_ENABLED",
       ready: appConfig.value.oidcReady,
       disabled: appConfig.value.oidcDisabled,
+    }),
+    authProviderCheck({
+      id: "reverse-proxy-auth-ready",
+      name: "Reverse Proxy",
+      envVar: "REVERSE_PROXY_AUTH_ENABLED",
+      ready: appConfig.value.reverseProxyAuthReady,
+      disabled: appConfig.value.reverseProxyAuthDisabled,
     }),
   ];
   return data;

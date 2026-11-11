@@ -5,7 +5,10 @@ from typing import Self
 from uuid import UUID
 
 import sqlalchemy as sa
+from fastapi import HTTPException
+from humps import decamelize
 from pydantic import UUID4
+from slugify import slugify
 from sqlalchemy.exc import IntegrityError
 
 from mealie.db.models.household import Household, HouseholdToRecipe
@@ -17,9 +20,10 @@ from mealie.db.models.recipe.tool import Tool
 from mealie.db.models.users.user_to_recipe import UserToRecipe
 from mealie.db.models.users.users import User
 from mealie.pkgs import cache
-from mealie.schema.cookbook.cookbook import ReadCookBook
-from mealie.schema.recipe import Recipe
-from mealie.schema.recipe.recipe import RecipePagination, RecipeSummary, create_recipe_slug
+from mealie.schema.cookbook.cookbook import CookBookOut
+from mealie.schema.recipe import RecipeOut
+from mealie.schema.recipe.recipe import RecipeDraft, RecipePagination, RecipeSummary, create_recipe_slug
+from mealie.schema.recipe.recipe_suggestion import RecipeSuggestionQuery
 from mealie.schema.response.pagination import PaginationQuery
 from mealie.services.query_filter.builder import QueryFilterBuilder
 
@@ -28,12 +32,15 @@ from ._recipe_suggestions import RecipeSuggestionMixin
 from .repository_generic import HouseholdRepositoryGeneric
 
 
-class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe, RecipeModel]):
+class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[RecipeOut, RecipeModel]):
     user_id: UUID4 | None = None
+    _last_made_household_id: UUID4 | None = None
 
     @property
-    def column_aliases(self):
+    def column_aliases(self) -> dict[str, sa.ColumnElement]:
         if not self.user_id:
+            if self._last_made_household_id:
+                return {"last_made": self._get_last_made_col_alias()}
             return {}
 
         return {
@@ -46,25 +53,29 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
         self.user_id = user_id
         return self
 
-    def _get_last_made_col_alias(self) -> sa.ColumnElement | None:
+    def _get_last_made_col_alias(self) -> sa.ColumnElement:
         """
-        Computed last_made which uses `HouseholdToRecipe.last_made` for the user's household,
-        otherwise an arbitrarily low date
+        Computed last_made which uses `HouseholdToRecipe.last_made` for the user's household (without a user,
+        for the household of the public cookbook being read), otherwise an arbitrarily low date
         """
 
-        user_household_subquery = sa.select(User.household_id).where(User.id == self.user_id).scalar_subquery()
+        household_id = (
+            sa.select(User.household_id).where(User.id == self.user_id).scalar_subquery()
+            if self.user_id
+            else self._last_made_household_id
+        )
         last_made_subquery = (
             sa.select(HouseholdToRecipe.last_made)
             .where(
                 HouseholdToRecipe.recipe_id == self.model.id,
-                HouseholdToRecipe.household_id == user_household_subquery,
+                HouseholdToRecipe.household_id == household_id,
             )
             .correlate(self.model)
             .scalar_subquery()
         )
         return sa.func.coalesce(last_made_subquery, datetime(year=1900, month=1, day=1, tzinfo=UTC))
 
-    def _get_rating_col_alias(self) -> sa.ColumnElement | None:
+    def _get_rating_col_alias(self) -> sa.ColumnElement:
         """Computed rating which uses the user's rating if it exists, otherwise falling back to the recipe's rating"""
 
         effective_rating = sa.case(
@@ -87,22 +98,65 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
         )
         return sa.cast(effective_rating, sa.Float)
 
-    def create(self, document: Recipe) -> Recipe:  # type: ignore
-        max_retries = 10
-        original_name: str = document.name  # type: ignore
+    def _validate_last_made_query(self, query: PaginationQuery | RecipeSuggestionQuery) -> None:
+        if self.user_id:
+            return
 
-        for i in range(1, 11):
+        if query.order_by and any(
+            decamelize(value.split(":", 1)[0].strip()) == "last_made" for value in query.order_by.split(",")
+        ):
+            raise HTTPException(400, "last_made is only available for authenticated household queries")
+
+        if query.query_filter:
+            try:
+                builder = QueryFilterBuilder(query.query_filter)
+            except ValueError:
+                # Let the existing query filter handling return the API's normal 400 response.
+                return
+
+            if any(
+                getattr(component, "attribute_name", None) == "last_made" for component in builder.filter_components
+            ):
+                raise HTTPException(400, "last_made is only available for authenticated household queries")
+
+    def create(self, document: RecipeDraft) -> RecipeOut:  # type: ignore[override]
+        if not document.name:
+            raise ValueError("A recipe needs a name before it is saved")
+
+        max_retries = 10
+        original_name = document.name
+        name_suffix = 0
+
+        for i in range(1, max_retries + 1):
             try:
                 return super().create(document)
             except IntegrityError:
                 self.session.rollback()
-                document.name = f"{original_name} ({i})"
-                document.slug = create_recipe_slug(document.name)
-
                 if i >= max_retries:
                     raise
 
-    def _delete_recipe(self, recipe: RecipeModel) -> Recipe:
+                # Existing names must not consume retries reserved for failed writes.
+                # Slugs are unique across the group, including other households.
+                while True:
+                    name_suffix += 1
+                    suffix = f"-{name_suffix}"
+                    base_slug = create_recipe_slug(original_name, max_length=250 - len(suffix)).rstrip("-")
+                    document.name = f"{original_name} ({name_suffix})"
+                    document.slug = f"{base_slug}{suffix}"
+                    exists = self.session.scalar(
+                        sa.select(
+                            sa.exists().where(
+                                self.model.group_id == document.group_id,
+                                self.model.slug == document.slug,
+                            )
+                        )
+                    )
+                    if not exists:
+                        break
+
+        raise RuntimeError(f"Failed to create recipe '{original_name}' after {max_retries} attempts")
+
+    def _delete_recipe(self, recipe: RecipeModel) -> RecipeOut:
         recipe_as_model = self.schema.model_validate(recipe)
 
         # first remove UserToRecipe entries so we don't run into stale data errors
@@ -124,15 +178,15 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
 
         return recipe_as_model
 
-    def delete(self, value, match_key: str | None = None) -> Recipe:
+    def delete(self, value, match_key: str | None = None) -> RecipeOut:
         match_key = match_key or self.primary_key
         recipe_in_db = self._query_one(value, match_key)
         return self._delete_recipe(recipe_in_db)
 
-    def delete_many(self, values: Iterable) -> list[Recipe]:
+    def delete_many(self, values: Iterable) -> list[RecipeOut]:
         query = self._query().filter(self.model.slug.in_(values)).filter_by(**self._filter_builder())
         recipes_in_db = self.session.execute(query).unique().scalars().all()
-        results: list[Recipe] = []
+        results: list[RecipeOut] = []
 
         # we create a delete statement for each row
         # we don't delete the whole query in one statement because postgres doesn't cascade correctly
@@ -199,19 +253,38 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
     def _resolve_organizer(self, model: type[Tag] | type[Category] | type[Tool], name: str) -> dict:
         """Look up an organizer (tag/category/tool) by name in this group, creating it if absent.
 
+        Matching is by name first, then by slug. Names are not unique per group, but the slug is
+        (`tags_slug_group_id_key` and friends), so a name that only differs by characters the slug
+        drops -- "Veggie!" against an existing "Veggie" -- must resolve to the existing row. Without
+        the slug lookup the insert violates that constraint and the request fails with a misleading
+        "Recipe already exists".
+
+        A name that slugifies to nothing is left to the insert, so it still fails the constraint
+        rather than matching some other organizer. Emoji and punctuation-only names all share the
+        empty slug, so matching on it would let "🔥" silently resolve to an existing "🍕".
+
+        The two lookups are separate queries rather than one `or_` because a name and a slug can
+        point at different rows: on a database whose `lower()` only folds ASCII, "Ξηροί καρποί" and
+        "ξηροί καρποί" are distinct names with distinct slugs, yet the first name-matches the
+        second and slug-matches itself. Combining them matches both rows and
+        `scalar_one_or_none()` raises `MultipleResultsFound`. Name wins when both match, as above.
+
         Race-safe under concurrent updates: if two requests create the same organizer name
         at once, the loser's IntegrityError is caught and it re-selects the winner's row
         instead of erroring or creating a duplicate.
         """
         normalized_name = name.strip()
         max_attempts = 10
+        slug = slugify(normalized_name)
+        in_group = model.group_id == self.group_id
+        name_matches = sa.func.lower(model.name) == normalized_name.lower()
 
         for attempt in range(1, max_attempts + 1):
-            existing = self.session.execute(
-                sa.select(model).where(
-                    model.group_id == self.group_id, sa.func.lower(model.name) == normalized_name.lower()
-                )
-            ).scalar_one_or_none()
+            existing = self.session.execute(sa.select(model).where(in_group, name_matches)).scalar_one_or_none()
+            if existing is None and slug:
+                existing = self.session.execute(
+                    sa.select(model).where(in_group, model.slug == slug)
+                ).scalar_one_or_none()
             if existing:
                 return {
                     "id": str(existing.id),
@@ -239,7 +312,7 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
 
         raise RuntimeError(f"Failed to resolve organizer '{name}' after {max_attempts} attempts")
 
-    def update(self, match_value: str | int | UUID4, new_data: dict | Recipe) -> Recipe:
+    def update(self, match_value: str | int | UUID4, new_data: dict | RecipeOut | RecipeDraft) -> RecipeOut:  # type: ignore[override]
         new_data = new_data if isinstance(new_data, dict) else new_data.model_dump()
         entry = self._query_one(match_value=match_value)
 
@@ -295,7 +368,7 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
         self,
         pagination: PaginationQuery,
         override=None,
-        cookbook: ReadCookBook | None = None,
+        cookbook: CookBookOut | None = None,
         categories: list[UUID4 | str] | None = None,
         tags: list[UUID4 | str] | None = None,
         tools: list[UUID4 | str] | None = None,
@@ -306,6 +379,7 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
         require_all_tools=True,
         require_all_foods=True,
         search: str | None = None,
+        extra_filter: sa.ColumnElement[bool] | None = None,
     ) -> RecipePagination:
         # Copy this, because calling methods (e.g. tests) might rely on it not getting mutated
         pagination_result = pagination.model_copy()
@@ -313,6 +387,11 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
 
         fltr = self._filter_builder()
         q = q.filter_by(**fltr)
+        if extra_filter is not None:
+            q = q.filter(extra_filter)
+
+        # Checked before the cookbook's own filter is added: only that one may use last_made without a user
+        self._validate_last_made_query(pagination_result)
 
         if cookbook:
             pagination_result.query_filter = QueryFilterBuilder.combine_filters(
@@ -342,7 +421,13 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
             # default ordering if not searching
             pagination_result.order_by = "created_at"
 
-        q, count, total_pages = self.add_pagination_to_query(q, pagination_result)
+        # Without a user, a public cookbook's filter resolves last_made against the cookbook's household
+        if cookbook and not self.user_id:
+            self._last_made_household_id = cookbook.household_id
+        try:
+            q, count, total_pages = self.add_pagination_to_query(q, pagination_result)
+        finally:
+            self._last_made_household_id = None
 
         # Apply options late, so they do not get used for counting
         q = q.options(*RecipeSummary.loader_options())
@@ -364,24 +449,28 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
         )
 
     @staticmethod
-    def _ingredient_uses_food(food: UUID4) -> sa.ColumnElement:
+    def _recipes_using_foods(foods: Sequence[UUID4 | str]) -> sa.ColumnElement:
         """
-        An ingredient counts as using a food when it calls for it, or offers it as a substitute.
+        Recipes with an ingredient that uses any of `foods`: it calls for the food, or offers it as
+        a substitute.
 
         The two are the same thing as far as the recipe is concerned: both are lost if the food
         goes away, which is what makes this the right question for the food delete warning.
+
+        Built as a UNION of the two lookups rather than an OR inside `recipe_ingredient.any()`: the
+        OR can't use the food_id indexes, so it checked every ingredient of every recipe.
         """
 
-        return sa.or_(
-            RecipeIngredientModel.food_id == food,
-            RecipeIngredientModel.substitutions.any(RecipeIngredientSubstitutionModel.substitute_food_id == food),
-        )
-
-    @staticmethod
-    def _ingredient_uses_any_food(foods: list[UUID4]) -> sa.ColumnElement:
-        return sa.or_(
-            RecipeIngredientModel.food_id.in_(foods),
-            RecipeIngredientModel.substitutions.any(RecipeIngredientSubstitutionModel.substitute_food_id.in_(foods)),
+        return RecipeModel.id.in_(
+            sa.union(
+                sa.select(RecipeIngredientModel.recipe_id).where(RecipeIngredientModel.food_id.in_(foods)),
+                sa.select(RecipeIngredientModel.recipe_id)
+                .join(
+                    RecipeIngredientSubstitutionModel,
+                    RecipeIngredientSubstitutionModel.ingredient_id == RecipeIngredientModel.id,
+                )
+                .where(RecipeIngredientSubstitutionModel.substitute_food_id.in_(foods)),
+            )
         )
 
     def _build_recipe_filter(
@@ -389,7 +478,7 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
         categories: list[UUID4] | None = None,
         tags: list[UUID4] | None = None,
         tools: list[UUID4] | None = None,
-        foods: list[UUID4] | None = None,
+        foods: Sequence[UUID4 | str] | None = None,
         households: list[UUID4] | None = None,
         require_all_categories: bool = True,
         require_all_tags: bool = True,
@@ -421,14 +510,14 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
                 fltr.append(RecipeModel.tools.any(Tool.id.in_(tools)))
         if foods:
             if require_all_foods:
-                fltr.extend(RecipeModel.recipe_ingredient.any(self._ingredient_uses_food(food)) for food in foods)
+                fltr.extend(self._recipes_using_foods([food]) for food in foods)
             else:
-                fltr.append(RecipeModel.recipe_ingredient.any(self._ingredient_uses_any_food(foods)))
+                fltr.append(self._recipes_using_foods(foods))
         if households:
             fltr.append(RecipeModel.household_id.in_(households))
         return fltr
 
-    def get_random(self, limit=1) -> list[Recipe]:
+    def get_random(self, limit=1) -> list[RecipeOut]:
         stmt = (
             sa.select(RecipeModel).filter(RecipeModel.household_id.is_not(None)).order_by(sa.func.random()).limit(limit)
         )  # Postgres and SQLite specific
@@ -439,7 +528,7 @@ class RepositoryRecipes(RecipeSuggestionMixin, HouseholdRepositoryGeneric[Recipe
 
         return [self.schema.model_validate(x) for x in self.session.execute(stmt).scalars().all()]
 
-    def get_by_slug(self, group_id: UUID4, slug: str) -> Recipe | None:
+    def get_by_slug(self, group_id: UUID4, slug: str) -> RecipeOut | None:
         stmt = sa.select(RecipeModel).filter(RecipeModel.group_id == group_id, RecipeModel.slug == slug)
         dbrecipe = self.session.execute(stmt).scalars().one_or_none()
         if dbrecipe is None:

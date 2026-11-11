@@ -1,4 +1,5 @@
 import json
+import zipfile
 from pathlib import Path
 
 import yaml
@@ -6,6 +7,7 @@ from PIL import UnidentifiedImageError
 from pydantic import UUID4
 
 from mealie.core import root_logger
+from mealie.pkgs.archive import ArchiveBudget
 from mealie.services.recipe.recipe_data_service import RecipeDataService
 
 
@@ -42,6 +44,38 @@ class MigrationReaders:
                     recipe_data["description"] = document
 
         return recipe_data
+
+
+MAX_EXTRACTED_ARCHIVE_SIZE = 5 * 1024**3
+"""Upper bound, in bytes, on what a single migration may unpack, nested archives included"""
+
+MAX_EXTRACTED_FILE_SIZE = 100 * 1024**2
+"""Upper bound, in bytes, on one unpacked file; recipe documents and photos run to a few MB"""
+
+MAX_ARCHIVE_ENTRIES = 100_000
+"""Upper bound on files a single migration may unpack, nested archives included"""
+
+
+def migration_budget() -> ArchiveBudget:
+    return ArchiveBudget(
+        bytes_left=MAX_EXTRACTED_ARCHIVE_SIZE,
+        entries_left=MAX_ARCHIVE_ENTRIES,
+        max_file_size=MAX_EXTRACTED_FILE_SIZE,
+    )
+
+
+def extract_zip(archive: Path, dest: str | Path, budget: ArchiveBudget | None = None) -> None:
+    """Extracts `archive` into `dest`, charging it against `budget` (a fresh migration budget by default).
+
+    Raises ArchiveTooLargeError, before writing anything, when the archive is over the budget.
+    Migrators that unpack nested archives pass one budget to every call.
+    """
+    if budget is None:
+        budget = migration_budget()
+
+    with zipfile.ZipFile(archive) as zip_file:
+        budget.spend(zip_file)
+        zip_file.extractall(dest)
 
 
 def split_by_comma(tag_string: str):
@@ -133,17 +167,19 @@ def import_image(src: str | Path, recipe_id: UUID4, extraction_root: Path | None
         src = Path(src)
 
     if extraction_root is not None:
-        if safe_local_path(src, extraction_root) is None:
+        safe_src = safe_local_path(src, extraction_root)
+        if safe_src is None:
             root_logger.get_logger().warning(
                 "Rejected image path outside extraction root: %s (root: %s)", src, extraction_root
             )
             return None
+        src = safe_src
 
     if not src.exists():
         return None
 
     data_service = RecipeDataService(recipe_id=recipe_id)
-    return data_service.write_image(src, src.suffix)
+    return data_service.write_image(src.read_bytes(), src.suffix)
 
 
 async def scrape_image(image_url: str, recipe_id: UUID4) -> Path | None:

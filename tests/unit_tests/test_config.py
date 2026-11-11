@@ -28,6 +28,25 @@ def test_non_default_settings(monkeypatch):
     assert app_settings.DOCS_URL is None
 
 
+def test_api_host_defaults_to_automatic_binding(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("API_HOST", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        assert get_app_settings().API_HOST == ""
+    finally:
+        get_app_settings.cache_clear()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "::", "::1"])
+def test_api_host_explicit_values_survive_parsing(host: str, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("API_HOST", host)
+    get_app_settings.cache_clear()
+    try:
+        assert get_app_settings().API_HOST == host
+    finally:
+        get_app_settings.cache_clear()
+
+
 def test_allowed_iframe_hosts_defaults(monkeypatch):
     monkeypatch.delenv("ALLOWED_IFRAME_HOSTS", raising=False)
     get_app_settings.cache_clear()
@@ -53,6 +72,24 @@ def test_allowed_iframe_hosts_extends_defaults(monkeypatch):
     assert len(hosts) == len(set(hosts))
 
 
+@pytest.mark.parametrize(
+    ("allowed", "url", "expected"),
+    [
+        ("", "json://10.0.0.1/hook", True),
+        ("ntfys, Discord", "ntfys://ntfy.sh/topic", True),
+        ("ntfys, Discord", "DISCORD://id/token", True),
+        ("ntfys, Discord", "ntfy://ntfy.sh/topic", False),
+        ("ntfys, Discord", "json://10.0.0.1/hook", False),
+        ("ntfys", "not-a-url", False),
+    ],
+)
+def test_is_apprise_url_allowed(allowed: str, url: str, expected: bool, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("APPRISE_ALLOWED_SCHEMAS", allowed)
+    get_app_settings.cache_clear()
+
+    assert get_app_settings().is_apprise_url_allowed(url) is expected
+
+
 def test_default_connection_args(monkeypatch):
     monkeypatch.setenv("DB_ENGINE", "sqlite")
     get_app_settings.cache_clear()
@@ -66,7 +103,14 @@ def test_pg_connection_args(monkeypatch):
     monkeypatch.setenv("POSTGRES_DB", "mealie")
     get_app_settings.cache_clear()
     app_settings = get_app_settings()
-    assert app_settings.DB_URL == "postgresql://mealie:mealie@postgres:5432/mealie"
+    assert app_settings.DB_URL == "postgresql+psycopg2://mealie:mealie@postgres:5432/mealie"
+
+
+def test_unknown_db_engine_is_rejected(monkeypatch):
+    monkeypatch.setenv("DB_ENGINE", "postgress")
+    get_app_settings.cache_clear()
+    with pytest.raises(ValueError, match="DB_ENGINE"):
+        get_app_settings()
 
 
 psql_validation_cases = [
@@ -83,7 +127,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie:P@ssword!@#$%%^^&&**()+;'\"'<>?{}[]@postgres:5432/mealie",
-            "postgresql://mealie:P%40ssword%21%40%23%24%25%25%5E%5E%26%26%2A%2A%28%29%2B%3B%27%22%27%3C%3E%3F%7B%7D%5B%5D@postgres:5432/mealie",
+            "postgresql+psycopg2://mealie:P%40ssword%21%40%23%24%25%25%5E%5E%26%26%2A%2A%28%29%2B%3B%27%22%27%3C%3E%3F%7B%7D%5B%5D@postgres:5432/mealie",
         ],
     ),
     (
@@ -91,7 +135,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie:P@ssword!@#$%%^^&&**()+;'\"'<>?{}[]@postgres/mealie",
-            "postgresql://mealie:P%40ssword%21%40%23%24%25%25%5E%5E%26%26%2A%2A%28%29%2B%3B%27%22%27%3C%3E%3F%7B%7D%5B%5D@postgres/mealie",
+            "postgresql+psycopg2://mealie:P%40ssword%21%40%23%24%25%25%5E%5E%26%26%2A%2A%28%29%2B%3B%27%22%27%3C%3E%3F%7B%7D%5B%5D@postgres/mealie",
         ],
     ),
     (
@@ -107,7 +151,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie:MyPassword@postgres:5432/mealie",
-            "postgresql://mealie:MyPassword@postgres:5432/mealie",
+            "postgresql+psycopg2://mealie:MyPassword@postgres:5432/mealie",
         ],
     ),
     (
@@ -115,7 +159,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie@postgres:5432/mealie",
-            "postgresql://mealie@postgres:5432/mealie",
+            "postgresql+psycopg2://mealie@postgres:5432/mealie",
         ],
     ),
     (
@@ -123,7 +167,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie@postgres/mealie",
-            "postgresql://mealie@postgres/mealie",
+            "postgresql+psycopg2://mealie@postgres/mealie",
         ],
     ),
     (
@@ -131,7 +175,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie:@/mealie?host=/run/postgresql",
-            "postgresql://mealie:@/mealie?host=/run/postgresql",
+            "postgresql+psycopg2://mealie:@/mealie?host=/run/postgresql",
         ],
     ),
     (
@@ -139,7 +183,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://mealie@/mealie?host=/run/postgresql",
-            "postgresql://mealie@/mealie?host=/run/postgresql",
+            "postgresql+psycopg2://mealie@/mealie?host=/run/postgresql",
         ],
     ),
     (
@@ -147,7 +191,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql:///mealie?host=/run/postgresql",
-            "postgresql:///mealie?host=/run/postgresql",
+            "postgresql+psycopg2:///mealie?host=/run/postgresql",
         ],
     ),
     (
@@ -155,7 +199,7 @@ psql_validation_cases = [
         [
             "POSTGRES_URL_OVERRIDE",
             "postgresql://user@host/db?sslmode=require&connect_timeout=10",
-            "postgresql://user@host/db?sslmode=require&connect_timeout=10",
+            "postgresql+psycopg2://user@host/db?sslmode=require&connect_timeout=10",
         ],
     ),
 ]
@@ -176,8 +220,8 @@ def test_pg_connection_url_encode_password(data, monkeypatch):
     pg_provider = app_settings.DB_PROVIDER
     expected = (
         expected
-        if expected.startswith("postgresql://")
-        else f"postgresql://{pg_provider.POSTGRES_USER}:{expected}@{pg_provider.POSTGRES_SERVER}:5432/{pg_provider.POSTGRES_DB}"
+        if expected.startswith("postgresql+psycopg2://")
+        else f"postgresql+psycopg2://{pg_provider.POSTGRES_USER}:{expected}@{pg_provider.POSTGRES_SERVER}:5432/{pg_provider.POSTGRES_DB}"
     )
 
     assert app_settings.DB_URL == expected

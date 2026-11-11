@@ -1,10 +1,11 @@
 ###############################################
 # Frontend Build
 ###############################################
-FROM node:24@sha256:3d27e5c11e5786e309ec3e03f93ae536eb36e6e5eb3714d5eb3300a36157add0 \
+FROM node:26@sha256:438603bbb5cda404b9416f0b5c8026f61501ab911760d861ec28c36b5d675725 \
     AS frontend-builder
 
-RUN npm install --global pnpm@11
+# renovate: datasource=npm depName=pnpm
+RUN npm install --global pnpm@12.18.0
 
 WORKDIR /frontend
 
@@ -22,7 +23,7 @@ RUN pnpm generate
 ###############################################
 # Base Image - Python
 ###############################################
-FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 \
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 \
     AS python-base
 
 ENV MEALIE_HOME="/app"
@@ -51,7 +52,8 @@ RUN apt-get update \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install uv
+# renovate: datasource=pypi depName=uv
+RUN pip install uv==0.13.7
 
 # Install from the committed lockfile; never re-resolve. The rolling
 # `exclude-newer` cooling window (pyproject [tool.uv]) would otherwise make
@@ -83,7 +85,7 @@ RUN uv export --no-dev --no-editable --no-emit-project --extra pgsql --format re
 
 ###############################################
 # Package Container
-# Only role is to hold the packages, or be overriden by a --build-context flag.
+# Only role is to hold the packages, or be overridden by a --build-context flag.
 ###############################################
 FROM scratch AS packages
 COPY --from=backend-builder /mealie/dist /

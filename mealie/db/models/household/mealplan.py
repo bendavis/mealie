@@ -1,7 +1,7 @@
 import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Column, Date, ForeignKey, String, Table, UniqueConstraint, orm
+from sqlalchemy import Column, Date, Float, ForeignKey, String, Table, UniqueConstraint, orm
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -56,6 +56,7 @@ class GroupMealPlan(SqlAlchemyBase, BaseMixins):
     __tablename__ = "group_meal_plans"
 
     date: FilterableColumn[datetime.date] = mapped_column(Date, index=True, nullable=False)
+    end_date: FilterableColumn[datetime.date | None] = mapped_column(Date, index=True, nullable=True)
     entry_type: FilterableColumn[str] = mapped_column(String, index=True, nullable=False)
     title: FilterableColumn[str] = mapped_column(String, index=True, nullable=False)
     text: FilterableColumn[str] = mapped_column(String, nullable=False)
@@ -68,6 +69,7 @@ class GroupMealPlan(SqlAlchemyBase, BaseMixins):
     user: Mapped[User | None] = orm.relationship("User", back_populates="mealplans")
 
     recipe_id: FilterableColumn[GUID | None] = mapped_column(GUID, ForeignKey("recipes.id"), index=True)
+    recipe_scale: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     recipe: Mapped[RecipeModel | None] = orm.relationship("RecipeModel", back_populates="meal_entries", uselist=False)
 
     @auto_init()

@@ -4,6 +4,7 @@ from .fetch import (
     FetchResult,
     ForceTimeoutException,
     ResponseTooLargeError,
+    fetch_via_flaresolverr,
     resilient_fetch,
 )
 from .transport import (
@@ -13,6 +14,7 @@ from .transport import (
     SafeTransport,
     is_blocked_ip,
     post,
+    validate_url,
 )
 
 __all__ = [
@@ -22,10 +24,12 @@ __all__ = [
     "InvalidDomainError",
     "is_blocked_ip",
     "post",
+    "validate_url",
     "BROWSER_IMPERSONATIONS",
     "SCRAPER_TIMEOUT",
     "FetchResult",
     "ForceTimeoutException",
     "ResponseTooLargeError",
+    "fetch_via_flaresolverr",
     "resilient_fetch",
 ]

@@ -1,12 +1,13 @@
 import asyncio
 import shutil
+import tempfile
 from logging import Logger
 from pathlib import Path
 
 from pydantic import UUID4
 
 from mealie.pkgs import img, safehttp
-from mealie.schema.recipe.recipe import Recipe
+from mealie.schema.recipe.recipe import RecipeOut
 from mealie.schema.recipe.recipe_image_types import RecipeImageTypes
 from mealie.services._base_service import BaseService
 
@@ -68,7 +69,7 @@ class RecipeDataService(BaseService):
         self.logger = logger or self.logger
         self.minifier = img.PillowMinifier(purge=True, logger=self.logger)
 
-        self.dir_data = Recipe.directory_from_id(self.recipe_id)
+        self.dir_data = RecipeOut.directory_from_id(self.recipe_id)
         self.dir_image = self.dir_data.joinpath("images")
         self.dir_image_timeline = self.dir_image.joinpath("timeline")
         self.dir_assets = self.dir_data.joinpath("assets")
@@ -82,31 +83,28 @@ class RecipeDataService(BaseService):
         except Exception as e:
             self.logger.exception(f"Failed to delete recipe data: {e}")
 
-    def write_image(self, file_data: bytes | Path, extension: str, image_dir: Path | None = None) -> Path:
+    def write_image(self, file_data: bytes, extension: str, image_dir: Path | None = None) -> Path:
         if not image_dir:
             image_dir = self.dir_image
 
-        extension = extension.replace(".", "")
-        image_path = image_dir.joinpath(f"original.{extension}")
-        image_path.unlink(missing_ok=True)
+        final_image_path = image_dir.joinpath(RecipeImageTypes.original.value)
 
-        if isinstance(file_data, Path):
-            shutil.copy2(file_data, image_path)
-        elif isinstance(file_data, bytes):
-            with open(image_path, "ab") as f:
-                f.write(file_data)
-        else:
-            with open(image_path, "ab") as f:
-                shutil.copyfileobj(file_data, f)
+        # Stage the upload and generated variants away from the live image files.
+        # A .webp upload would otherwise overwrite original.webp before Pillow has
+        # validated it, destroying the existing image when minification fails.
+        with tempfile.TemporaryDirectory(dir=image_dir) as staging_dir:
+            staging_dir_path = Path(staging_dir)
+            staged_image_path = staging_dir_path / "upload"
 
-        try:
-            self.minifier.minify(image_path)
-        except Exception:
-            # Remove the partially-written file so corrupt images don't persist on disk.
-            image_path.unlink(missing_ok=True)
-            raise
+            staged_image_path.write_bytes(file_data)
 
-        return image_path
+            self.minifier.minify(staged_image_path)
+
+            for image_type in RecipeImageTypes:
+                staged_variant = staging_dir_path.joinpath(image_type.value)
+                staged_variant.replace(image_dir.joinpath(image_type.value))
+
+        return final_image_path
 
     def delete_image(self, image_dir: Path | None = None):
         if not image_dir:
